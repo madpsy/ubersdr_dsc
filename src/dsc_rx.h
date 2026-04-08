@@ -78,8 +78,6 @@ private:
     // Envelope / ATC state (per-instance, not static)
     double m_mark_env;
     double m_space_env;
-    double m_mark_noise;
-    double m_space_noise;
 
     // ---- DSC-specific state ----
 
@@ -113,7 +111,6 @@ private:
     cmplx mixer(double & phase, double f, cmplx in);
     void process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples);
     double envelope_decay(double avg, double value);
-    double noise_decay(double avg, double value);
 
     // Bit-level processing
     void handle_bit_value(bool bit);

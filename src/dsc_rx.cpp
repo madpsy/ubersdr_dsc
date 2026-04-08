@@ -88,13 +88,9 @@ dsc_rx::dsc_rx(int sample_rate, MessageCallback callback,
     m_data     = false;
     m_dataPrev = false;
 
-    // Envelope / ATC state — per-instance (not static like navtex_rx)
-    // Initialise noise floor to a small non-zero value to avoid the ATC
-    // formula producing garbage during the FFT filter startup transient.
-    m_mark_env    = 0;
-    m_space_env   = 0;
-    m_mark_noise  = 1.0;
-    m_space_noise = 1.0;
+    // Envelope trackers — start at zero, fast-attack will ramp up quickly
+    m_mark_env  = 0;
+    m_space_env = 0;
 
     // DSC-specific state
     m_bits     = 0;
@@ -228,29 +224,24 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
         double mark_abs  = std::abs(zp_mark[i]);
         double space_abs = std::abs(zp_space[i]);
 
-        // Determine noise floor & envelope for mark & space
-        m_mark_env   = envelope_decay(m_mark_env, mark_abs);
-        m_mark_noise = noise_decay(m_mark_noise, mark_abs);
+        // Update envelope trackers (fast attack, slow decay)
+        m_mark_env  = envelope_decay(m_mark_env,  mark_abs);
+        m_space_env = envelope_decay(m_space_env, space_abs);
 
-        m_space_env   = envelope_decay(m_space_env, space_abs);
-        m_space_noise = noise_decay(m_space_noise, space_abs);
-
-        double noise_floor = (m_space_noise + m_mark_noise) / 2.0;
-
-        // Clip mark & space to envelope & floor
+        // Clip to envelope (prevent outliers from skewing the ATC)
         mark_abs  = std::min(mark_abs, m_mark_env);
-        mark_abs  = std::max(mark_abs, noise_floor);
-
         space_abs = std::min(space_abs, m_space_env);
-        space_abs = std::max(space_abs, noise_floor);
 
-        // Mark-space discriminator with automatic threshold correction
-        // (W7AY ATC algorithm: http://www.w7ay.net/site/Technical/ATC/)
-        double logic_level =
-            (mark_abs - noise_floor) * (m_mark_env - noise_floor) -
-            (space_abs - noise_floor) * (m_space_env - noise_floor) -
-            0.5 * ((m_mark_env - noise_floor) * (m_mark_env - noise_floor) -
-                   (m_space_env - noise_floor) * (m_space_env - noise_floor));
+        // Mark-space discriminator with automatic threshold correction.
+        // Uses the SDRangel simplified ATC: subtract half the envelope from
+        // each channel before comparing.  This is more robust than the full
+        // W7AY quadratic formula when the mark/space envelopes are unbalanced
+        // (common on HF due to selective fading), which can cause the quadratic
+        // term to dominate and invert the bit decision.
+        // http://www.w7ay.net/site/Technical/ATC/
+        double bias_mark  = mark_abs  - 0.5 * m_mark_env;
+        double bias_space = space_abs - 0.5 * m_space_env;
+        double logic_level = bias_mark - bias_space;
 
         // Demodulated bit decision: positive logic_level = mark = 1
         m_dataPrev = m_data;
@@ -315,16 +306,6 @@ double dsc_rx::envelope_decay(double avg, double value)
         divisor = static_cast<int>(m_bit_sample_count / 4);
     else
         divisor = static_cast<int>(m_bit_sample_count * 16);
-    return decayavg(avg, value, divisor);
-}
-
-double dsc_rx::noise_decay(double avg, double value)
-{
-    int divisor;
-    if (value < avg)
-        divisor = static_cast<int>(m_bit_sample_count / 4);
-    else
-        divisor = static_cast<int>(m_bit_sample_count * 48);
     return decayavg(avg, value, divisor);
 }
 
