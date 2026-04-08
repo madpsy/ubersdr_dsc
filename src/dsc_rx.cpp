@@ -9,7 +9,8 @@
  * ubersdr delivers IQ at 10000 Hz, so all sample-count constants are
  * multiplied by 10 (RATE_SCALE = 10).
  *
- * The algorithm is otherwise a direct translation of dscdemodsink.cpp:
+ * The algorithm is a direct translation of dscdemodsink.cpp using the
+ * SDRangel FirFilter / Lowpass<Complex> template from firfilter.h:
  *   - Complex exponential table at FREQUENCY_SHIFT/2 = 85 Hz
  *   - Two Lowpass<Complex> FIR filters (301 taps, cutoff = BAUD_RATE * 1.1)
  *   - Two MovingMaximum envelope trackers (window = samplesPerBit * 8)
@@ -19,10 +20,6 @@
  *   - Sample bit when clockCount >= samplesPerBit/2 - 1
  *   - Phasing detection: exact 30-bit pattern match
  *   - Symbol decoding: every 10 bits via DSCDecoder
- *
- * FIR filter: exact port of SDRangel's generateLowPassFilter() +
- * FirFilter<Complex>::filter() — uses half-tap symmetry optimisation,
- * absolute Hz cutoff (not normalised), and SDRangel's Blackman window.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -51,104 +48,6 @@ static const int    RATE_SCALE = 10;   // 10000 / 1000
 static const int    EXP_LENGTH    = DSCDEMOD_EXP_LENGTH * RATE_SCALE;  // 6000
 static const int    SAMPLES_PER_BIT = (DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE)
                                       / DSCDEMOD_BAUD_RATE;            // 100
-
-// -----------------------------------------------------------------------
-// SimpleLowpass — exact port of SDRangel's generateLowPassFilter() +
-// FirFilter<Complex>::filter().
-//
-// SDRangel stores only the half-taps (nTaps/2 + 1 entries) and exploits
-// the symmetry of a linear-phase FIR:
-//   acc += (samples[a] + samples[b]) * taps[i]   for i = 0..n_taps-1
-//   acc += samples[a] * taps[n_taps]              (centre tap)
-//
-// The tap generator (firfilter.cpp::generateLowPassFilter) uses:
-//   Wc = 2π * cutoff / sampleRate
-//   taps[i] = sin(n * Wc) / (n * π)   (sinc, n = i - halfTaps + 1)
-//   taps[halfTaps-1] = Wc / π          (centre tap, n=0)
-//   Blackman: 0.42 + 0.5*cos(2πn/nTaps) + 0.08*cos(4πn/nTaps)
-//   Normalise: sum = 2 * Σ(taps[0..halfTaps-2]) + taps[halfTaps-1]
-// -----------------------------------------------------------------------
-void SimpleLowpass::create(int nTaps, double sampleRate, double cutoff)
-{
-    // nTaps must be odd
-    if (!(nTaps & 1)) nTaps++;
-
-    double Wc       = (2.0 * M_PI * cutoff) / sampleRate;
-    int    halfTaps = nTaps / 2 + 1;   // number of tap entries stored
-
-    m_taps.resize(halfTaps);
-
-    for (int i = 0; i < halfTaps; ++i)
-    {
-        if (i == halfTaps - 1)
-        {
-            // Centre tap (n = 0): sinc(0) = Wc/π
-            m_taps[i] = Wc / M_PI;
-        }
-        else
-        {
-            int n = i - (nTaps - 1) / 2;   // n is negative for i < halfTaps-1
-            m_taps[i] = std::sin(n * Wc) / (n * M_PI);
-        }
-    }
-
-    // Blackman window — SDRangel: 0.42 + 0.5*cos(2πn/nTaps) + 0.08*cos(4πn/nTaps)
-    for (int i = 0; i < halfTaps; ++i)
-    {
-        int n = i - (nTaps - 1) / 2;
-        m_taps[i] *= 0.42 + 0.5  * std::cos((2.0 * M_PI * n) / nTaps)
-                          + 0.08 * std::cos((4.0 * M_PI * n) / nTaps);
-    }
-
-    // Normalise: full filter sum = 2 * Σ(half taps except centre) + centre
-    double sum = 0.0;
-    for (int i = 0; i < halfTaps - 1; ++i)
-        sum += m_taps[i] * 2.0;
-    sum += m_taps[halfTaps - 1];
-
-    for (auto &t : m_taps) t /= sum;
-
-    // Circular buffer — must hold the FULL nTaps samples (not just halfTaps).
-    // SDRangel's FirFilter<T>::init(nTaps) does: m_samples.resize(nTaps).
-    // The symmetric convolution walks pointers a (backward) and b (forward)
-    // across the full nTaps-sample history; with only halfTaps entries the
-    // pointers collide after ~75 steps and the filter is completely wrong.
-    m_buf.assign(nTaps, cmplx(0.0, 0.0));
-    m_ptr = 0;
-}
-
-cmplx SimpleLowpass::filter(cmplx in)
-{
-    // Exact port of SDRangel FirFilter<Complex>::filter()
-    // m_taps has halfTaps = nTaps/2 + 1 entries
-    // m_buf  has halfTaps entries (circular)
-    unsigned int n_samples = (unsigned int)m_buf.size();
-    unsigned int n_taps    = (unsigned int)m_taps.size() - 1;  // last tap is centre
-
-    // Write new sample
-    m_buf[m_ptr] = in;
-
-    unsigned int a = m_ptr;
-    unsigned int b = (a == n_samples - 1) ? 0 : a + 1;
-
-    cmplx acc(0.0, 0.0);
-
-    for (unsigned int i = 0; i < n_taps; ++i)
-    {
-        acc += (m_buf[a] + m_buf[b]) * m_taps[i];
-
-        a = (a == 0)             ? n_samples - 1 : a - 1;
-        b = (b == n_samples - 1) ? 0             : b + 1;
-    }
-
-    // Centre tap
-    acc += m_buf[a] * m_taps[n_taps];
-
-    // Advance write pointer
-    m_ptr = (m_ptr == n_samples - 1) ? 0 : m_ptr + 1;
-
-    return acc;
-}
 
 // -----------------------------------------------------------------------
 // MovingMaximum
@@ -191,7 +90,7 @@ dsc_rx::dsc_rx(int sample_rate, MessageCallback callback,
     const double step = 2.0 * M_PI * (DSCDEMOD_FREQUENCY_SHIFT / 2.0)
                         / (double)(DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE);
     for (int i = 0; i < EXP_LENGTH; i++) {
-        m_exp[i] = cmplx(std::cos(f0), std::sin(f0));
+        m_exp[i] = Complex(std::cos(f0), std::sin(f0));
         f0 += step;
         if (f0 >= 2.0 * M_PI) f0 -= 2.0 * M_PI;
     }
@@ -252,7 +151,7 @@ void dsc_rx::process(const int16_t *iq_data, int nb_samples)
     for (int i = 0; i < nb_samples; i++) {
         double I = (double)iq_data[i * 2    ] * scale;
         double Q = (double)iq_data[i * 2 + 1] * scale;
-        processOneSample(cmplx(I, Q));
+        processOneSample(Complex(I, Q));
         m_dbg_sample_count++;
     }
 
@@ -279,7 +178,7 @@ void dsc_rx::process(const int16_t *iq_data, int nb_samples)
 // -----------------------------------------------------------------------
 // processOneSample — direct translation of DSCDemodSink::processOneSample()
 // -----------------------------------------------------------------------
-void dsc_rx::processOneSample(cmplx ci)
+void dsc_rx::processOneSample(Complex ci)
 {
     // RSSI accumulation while receiving (before any scaling — already normalised)
     if (m_gotSOP) {
@@ -291,11 +190,11 @@ void dsc_rx::processOneSample(cmplx ci)
     // Correlate with complex exponential at ±85 Hz
     // SDRangel: corr1 = ci * exp[idx]  (mark channel)
     //           corr2 = ci * conj(exp[idx])  (space channel)
-    cmplx exp_val = m_exp[m_expIdx];
+    Complex exp_val = m_exp[m_expIdx];
     m_expIdx = (m_expIdx + 1) % EXP_LENGTH;
 
-    cmplx corr1 = ci * exp_val;            // mark  (+85 Hz)
-    cmplx corr2 = ci * std::conj(exp_val); // space (-85 Hz)
+    Complex corr1 = ci * exp_val;                        // mark  (+85 Hz)
+    Complex corr2 = ci * std::conj(exp_val);             // space (-85 Hz)
 
     // Low-pass filter then take magnitude
     double abs1Filt = std::abs(m_lpfMark.filter(corr1));

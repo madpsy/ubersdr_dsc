@@ -1,10 +1,7 @@
 add_library(libdsc SHARED
     dsc_rx.cpp
-    dsc_decoder.cpp
-    dsc_message.cpp
-    dsc_message_tables.cpp
-    dsc_message_strings.cpp
-    dsc_message_json.cpp
+    firfilter.cpp
+    dsc.cpp
     mmsi.cpp
     coast_stations.cpp
     channel_manager.cpp

@@ -27,29 +27,9 @@
 #include <vector>
 #include <deque>
 
+#include "firfilter.h"
 #include "dsc_decoder.h"
 #include "dsc_message.h"
-
-typedef std::complex<double> cmplx;
-
-// -----------------------------------------------------------------------
-// FIR lowpass filter for complex samples.
-// Exact port of SDRangel's Lowpass<Complex> + generateLowPassFilter().
-// Uses symmetric half-tap storage and circular buffer.
-// -----------------------------------------------------------------------
-class SimpleLowpass {
-public:
-    // sampleRate: Hz (e.g. 10000)
-    // cutoff:     Hz (e.g. 110 for BAUD_RATE * 1.1)
-    void create(int nTaps, double sampleRate, double cutoff);
-    cmplx filter(cmplx in);
-
-private:
-    // Half-taps (nTaps/2 + 1 entries), matching SDRangel's generateLowPassFilter
-    std::vector<double> m_taps;
-    std::vector<cmplx>  m_buf;   // circular buffer (nTaps/2 + 1 entries)
-    int                 m_ptr;   // write position
-};
 
 // -----------------------------------------------------------------------
 // Moving maximum over a sliding window (mirrors SDRangel's MovingMaximum)
@@ -98,11 +78,11 @@ private:
     int m_sample_rate;
 
     // ---- IQ demodulator state ----
-    std::vector<cmplx> m_exp;      // complex exponential table (len 6000)
-    int                m_expIdx;
+    std::vector<Complex> m_exp;      // complex exponential table (len 6000)
+    int                  m_expIdx;
 
-    SimpleLowpass m_lpfMark;       // FIR lowpass, mark channel
-    SimpleLowpass m_lpfSpace;      // FIR lowpass, space channel
+    Lowpass<Complex> m_lpfMark;    // FIR lowpass, mark channel
+    Lowpass<Complex> m_lpfSpace;   // FIR lowpass, space channel
 
     MovingMaximum m_movMaxMark;    // envelope tracker, mark
     MovingMaximum m_movMaxSpace;   // envelope tracker, space
@@ -134,7 +114,7 @@ private:
     long long   m_dbg_sample_count;
 
     // ---- Private methods ----
-    void processOneSample(cmplx ci);
+    void processOneSample(Complex ci);
     void receiveBit(bool bit);
     void init();
 };
