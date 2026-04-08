@@ -272,7 +272,10 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
         // when it reaches samplesPerBit/2 - 1 we are in the middle of the
         // bit — sample it and wrap the counter back by one full bit period.
         // ---------------------------------------------------------------
-        if (m_data && !m_dataPrev) {
+        // Correct clock on any bit transition (both rising and falling edges).
+        // At 120 samples/bit, correcting only on rising edges leaves too much
+        // drift during long same-bit runs; both edges halve the maximum drift.
+        if (m_data != m_dataPrev) {
             m_clockCount -= m_clockCount * 0.25;
         }
 
