@@ -2,15 +2,17 @@
 /*
  * dsc_rx.h — DSC (Digital Selective Calling) FSK receiver
  *
- * Demodulator ported from SDRangel DSCDemodSink (Jon Beniston, M7RCE):
- *   - Receives CS16 IQ samples at 10000 Hz from ubersdr
- *   - Single complex exponential at ±85 Hz (half the 170 Hz shift)
- *   - FIR lowpass at baud_rate * 1.1 = 110 Hz
- *   - Moving-maximum envelope
- *   - Simplified ATC: bias = abs - 0.5 * env
- *   - Edge-triggered clock recovery with 25% correction
+ * Direct port of SDRangel DSCDemodSink (Jon Beniston, M7RCE) scaled for
+ * 10000 Hz input from ubersdr (SDRangel uses 1000 Hz internally).
  *
- * DSC framing adapted from SDRangel DSCDemodSink (Jon Beniston, M7RCE)
+ * Signal chain (identical to SDRangel, all constants × RATE_SCALE=10):
+ *   - Complex exponential table at FREQUENCY_SHIFT/2 = 85 Hz (len 6000)
+ *   - Two FIR lowpass filters: 301 taps, cutoff = BAUD_RATE * 1.1 = 110 Hz
+ *   - Two MovingMaximum envelope trackers: window = samplesPerBit * 8 = 800
+ *   - ATC: bias = abs - 0.5 * env
+ *   - Clock recovery: rising edge (0→1) only, 25% correction
+ *   - Phasing: exact 30-bit pattern match
+ *   - Symbol decode: every 10 bits via DSCDecoder
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -31,22 +33,22 @@
 typedef std::complex<double> cmplx;
 
 // -----------------------------------------------------------------------
-// Simple FIR lowpass filter for complex samples
+// FIR lowpass filter for complex samples — circular buffer implementation
+// (mirrors SDRangel's Lowpass<Complex>)
 // -----------------------------------------------------------------------
 class SimpleLowpass {
 public:
-    // Create a windowed-sinc FIR lowpass with cutoff fc (normalised 0..0.5)
-    // and 'taps' coefficients (must be odd).
-    void create(int taps, double fc);
+    void create(int taps, double fc);  // fc normalised 0..0.5
     cmplx filter(cmplx in);
 
 private:
     std::vector<double> m_coeffs;
-    std::deque<cmplx>   m_buf;
+    std::vector<cmplx>  m_buf;   // circular buffer
+    int                 m_pos;   // write position
 };
 
 // -----------------------------------------------------------------------
-// Moving maximum over a sliding window
+// Moving maximum over a sliding window (mirrors SDRangel's MovingMaximum)
 // -----------------------------------------------------------------------
 class MovingMaximum {
 public:
@@ -61,88 +63,76 @@ private:
 };
 
 // -----------------------------------------------------------------------
-// DSC receiver — IQ input, SDRangel-style demodulation
+// DSC receiver — IQ input, SDRangel-compatible demodulation at 10000 Hz
 // -----------------------------------------------------------------------
 class dsc_rx {
 public:
     using MessageCallback = std::function<void(const DSCMessage& msg, int errors, float rssi)>;
 
-    // sample_rate: IQ sample rate from ubersdr (expected 10000 Hz)
-    // label: short string for debug log lines, e.g. "16.806 MHz"
+    // sample_rate: IQ sample rate from ubersdr (must be 10000 Hz)
+    // label: short string for log lines, e.g. "16.806 MHz"
     dsc_rx(int sample_rate, MessageCallback callback,
            const std::string &label = "");
     ~dsc_rx() = default;
 
     // Feed CS16 interleaved I/Q samples (little-endian int16 pairs)
-    void process(const int16_t * iq_data, int nb_samples);
+    void process(const int16_t *iq_data, int nb_samples);
 
     // Statistics for web UI / monitoring
     struct DecoderStats {
-        double signal_level;     // mark envelope level
-        double mark_level;       // mark channel envelope
-        double space_level;      // space channel envelope
-        bool   receiving;        // true if phasing detected, message in progress
-        int    bit_count;        // bits received in current message
-        double rssi_db;          // current RSSI in dB (only valid while receiving)
+        double signal_level;  // mark_env - space_env
+        double mark_level;    // mark channel envelope
+        double space_level;   // space channel envelope
+        bool   receiving;     // true if phasing locked, message in progress
+        int    bit_count;     // bits received in current message
+        double rssi_db;       // RSSI in dB (valid while receiving)
     };
     DecoderStats getStats() const;
 
 private:
     // ---- Configuration ----
-    int    m_sample_rate;
-    double m_baud_rate;          // 100.0
-    double m_bit_sample_count;   // sample_rate / baud_rate
+    int m_sample_rate;
 
-    // ---- IQ demodulator state (SDRangel style) ----
-
-    // Pre-computed complex exponential table for the half-shift frequency
-    // (85 Hz = 170/2).  Length = sample_rate / gcd(sample_rate, 85).
-    std::vector<cmplx> m_exp;
+    // ---- IQ demodulator state ----
+    std::vector<cmplx> m_exp;      // complex exponential table (len 6000)
     int                m_expIdx;
 
-    // FIR lowpass filters for mark and space channels
-    SimpleLowpass m_lpfMark;
-    SimpleLowpass m_lpfSpace;
+    SimpleLowpass m_lpfMark;       // FIR lowpass, mark channel
+    SimpleLowpass m_lpfSpace;      // FIR lowpass, space channel
 
-    // Moving-maximum envelope trackers (window = 8 bit periods)
-    MovingMaximum m_movMaxMark;
-    MovingMaximum m_movMaxSpace;
+    MovingMaximum m_movMaxMark;    // envelope tracker, mark
+    MovingMaximum m_movMaxSpace;   // envelope tracker, space
 
-    // ---- Edge-triggered clock recovery ----
+    // ---- Clock recovery ----
     double m_clockCount;
-    bool   m_data;       // current demodulated bit
-    bool   m_dataPrev;   // previous bit (for edge detection)
+    bool   m_data;      // current bit
+    bool   m_dataPrev;  // previous bit (for rising-edge detection)
 
     // ---- Envelope levels (for stats) ----
     double m_markEnv;
     double m_spaceEnv;
 
-    // ---- DSC-specific state ----
+    // ---- DSC framing state ----
     DSCDecoder   m_dscDecoder;
     unsigned int m_bits;
     int          m_bitCount;
     bool         m_gotSOP;
 
-    // RSSI tracking during message reception
+    // ---- RSSI accumulation ----
     double m_rssiMagSqSum;
     int    m_rssiMagSqCount;
 
-    // Callback for decoded messages
+    // ---- Callback ----
     MessageCallback m_callback;
 
-    // ---- Debug / diagnostics ----
+    // ---- Debug ----
     std::string m_dbg_label;
     long long   m_dbg_sample_count;
-    long long   m_dbg_total_bits;
-    long long   m_dbg_near_miss_sample;
-    long long   m_dbg_stats_sample;
 
     // ---- Private methods ----
     void processOneSample(cmplx ci);
     void receiveBit(bool bit);
     void init();
-
-    static int hamming30(unsigned int a, unsigned int b);
 };
 
 #endif /* _DSC_RX_H */
