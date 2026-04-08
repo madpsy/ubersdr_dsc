@@ -1,0 +1,460 @@
+/* -*- c++ -*- */
+/*
+ * dsc_rx.cpp — DSC (Digital Selective Calling) FSK receiver
+ *
+ * FSK demodulator adapted from navtex_rx.cpp:
+ *   Copyright 2020 Franco Venturi
+ *   Copyright (C) 2011-2016 Remi Chateauneu, F4ECW
+ *   Copyright (C) Rik van Riel, AB1KW
+ *   Copyright (C) Paul Lutus (JNX)
+ *
+ * DSC framing adapted from SDRangel dscdemodsink.cpp:
+ *   Copyright (C) 2023 Jon Beniston, M7RCE
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+// -----------------------------------------------------------------------
+// Architecture overview
+//
+// The FSK demodulator is taken directly from navtex_rx.cpp:
+//   1. Mark/space bandpass filters (FFT overlap-add via fftfilt)
+//   2. Envelope detection with fast-attack / slow-decay averaging
+//   3. Automatic threshold correction (W7AY ATC algorithm)
+//   4. Multicorrelator bit synchronization (early/prompt/late)
+//
+// DSC and NAVTEX share identical RF parameters:
+//   - 100 baud, 170 Hz shift, center frequency 500 Hz
+//
+// The bit-level processing replaces NAVTEX's 7-bit CCIR 476 / SITOR-B
+// framing with DSC's 10-bit symbol framing:
+//   - Before phasing: check every bit against 30-bit phasing patterns
+//     (3 consecutive 10-bit symbols from DSCDecoder::m_phasingPatterns)
+//   - After phasing: every 10 bits, feed into DSCDecoder::decodeBits()
+//   - When DSCDecoder signals message complete, construct DSCMessage
+//     and invoke the callback
+// -----------------------------------------------------------------------
+
+#include "dsc_rx.h"
+#include "fftfilt.h"
+#include "misc.h"
+
+#include <cmath>
+#include <cstring>
+#include <ctime>
+
+// DSC / NAVTEX share these RF parameters
+static const int    deviation_f       = 85;       // ±85 Hz = 170 Hz shift
+static const double dflt_center_freq  = 500.0;    // audio center frequency
+
+// -----------------------------------------------------------------------
+// Constructor
+// -----------------------------------------------------------------------
+dsc_rx::dsc_rx(int sample_rate, MessageCallback callback)
+    : m_sample_rate(sample_rate),
+      m_callback(std::move(callback))
+{
+    m_center_frequency_f = dflt_center_freq;
+    m_baud_rate = 100.0;
+
+    double bit_duration_seconds = 1.0 / m_baud_rate;
+    m_bit_sample_count = m_sample_rate * bit_duration_seconds;
+
+    m_sample_count = 0;
+
+    // Multicorrelator — spread of 1/5 bit period
+    m_early_accumulator  = 0;
+    m_prompt_accumulator = 0;
+    m_late_accumulator   = 0;
+
+    m_next_early_event  = 0;
+    m_next_prompt_event = m_bit_sample_count / 5;
+    m_next_late_event   = m_bit_sample_count * 2 / 5;
+
+    m_average_early_signal  = 0;
+    m_average_prompt_signal = 0;
+    m_average_late_signal   = 0;
+
+    m_pulse_edge_event    = false;
+    m_averaged_mark_state = 0;
+
+    // Envelope / ATC state — per-instance (not static like navtex_rx)
+    m_mark_env    = 0;
+    m_space_env   = 0;
+    m_mark_noise  = 0;
+    m_space_noise = 0;
+
+    // DSC-specific state
+    m_bits     = 0;
+    m_bitCount = 0;
+    m_gotSOP   = false;
+
+    m_rssiMagSqSum   = 0.0;
+    m_rssiMagSqCount = 0;
+
+    // Filters
+    m_mark_lowpass  = nullptr;
+    m_space_lowpass = nullptr;
+
+    set_filter_values();
+    configure_filters();
+}
+
+// -----------------------------------------------------------------------
+// Destructor
+// -----------------------------------------------------------------------
+dsc_rx::~dsc_rx()
+{
+    delete m_mark_lowpass;
+    delete m_space_lowpass;
+}
+
+// -----------------------------------------------------------------------
+// Reset decoder state (called after a message completes or on error)
+// -----------------------------------------------------------------------
+void dsc_rx::init()
+{
+    m_bits     = 0;
+    m_bitCount = 0;
+    m_gotSOP   = false;
+
+    m_rssiMagSqSum   = 0.0;
+    m_rssiMagSqCount = 0;
+}
+
+// -----------------------------------------------------------------------
+// Filter setup — identical to navtex_rx
+// -----------------------------------------------------------------------
+void dsc_rx::set_filter_values()
+{
+    m_mark_f     = m_center_frequency_f + deviation_f;
+    m_space_f    = m_center_frequency_f - deviation_f;
+    m_mark_phase  = 0;
+    m_space_phase = 0;
+}
+
+void dsc_rx::configure_filters()
+{
+    const int filtlen = 512;
+
+    delete m_mark_lowpass;
+    m_mark_lowpass = new fftfilt(m_baud_rate / m_sample_rate, filtlen);
+    m_mark_lowpass->rtty_filter(m_baud_rate / m_sample_rate);
+
+    delete m_space_lowpass;
+    m_space_lowpass = new fftfilt(m_baud_rate / m_sample_rate, filtlen);
+    m_space_lowpass->rtty_filter(m_baud_rate / m_sample_rate);
+}
+
+// -----------------------------------------------------------------------
+// Public process() — feed audio samples
+// -----------------------------------------------------------------------
+void dsc_rx::process(const float * data, int nb_samples)
+{
+    cmplx z, zmark, zspace, *zp_mark, *zp_space;
+
+    for (int i = 0; i < nb_samples; i++) {
+        // Scale float [-1,1] to int16 range, same as navtex_rx
+        double dv = 32767.0 * data[i];
+        z = cmplx(dv, dv);
+
+        zmark = mixer(m_mark_phase, m_mark_f, z);
+        m_mark_lowpass->run(zmark, &zp_mark);
+
+        zspace = mixer(m_space_phase, m_space_f, z);
+        int n_out = m_space_lowpass->run(zspace, &zp_space);
+
+        if (n_out)
+            process_fft_output(zp_mark, zp_space, n_out);
+    }
+}
+
+void dsc_rx::process(const int16_t * data, int nb_samples)
+{
+    cmplx z, zmark, zspace, *zp_mark, *zp_space;
+
+    for (int i = 0; i < nb_samples; i++) {
+        z = cmplx(data[i], data[i]);
+
+        zmark = mixer(m_mark_phase, m_mark_f, z);
+        m_mark_lowpass->run(zmark, &zp_mark);
+
+        zspace = mixer(m_space_phase, m_space_f, z);
+        int n_out = m_space_lowpass->run(zspace, &zp_space);
+
+        if (n_out)
+            process_fft_output(zp_mark, zp_space, n_out);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Mixer — frequency shift via complex multiply (from navtex_rx)
+// -----------------------------------------------------------------------
+cmplx dsc_rx::mixer(double & phase, double f, cmplx in)
+{
+    cmplx z = cmplx(cos(phase), sin(phase)) * in;
+
+    phase -= 2.0 * M_PI * f / m_sample_rate;
+    if (phase < -2.0 * M_PI)
+        phase += 2.0 * M_PI;
+
+    return z;
+}
+
+// -----------------------------------------------------------------------
+// Process FFT filter output — envelope detection + ATC + bit sampling
+// Adapted from navtex_rx::process_fft_output() with per-instance state
+// -----------------------------------------------------------------------
+void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
+{
+    for (int i = 0; i < samples; i++) {
+        double mark_abs  = std::abs(zp_mark[i]);
+        double space_abs = std::abs(zp_space[i]);
+
+        process_multicorrelator();
+
+        // Determine noise floor & envelope for mark & space
+        m_mark_env   = envelope_decay(m_mark_env, mark_abs);
+        m_mark_noise = noise_decay(m_mark_noise, mark_abs);
+
+        m_space_env   = envelope_decay(m_space_env, space_abs);
+        m_space_noise = noise_decay(m_space_noise, space_abs);
+
+        double noise_floor = (m_space_noise + m_mark_noise) / 2.0;
+
+        // Clip mark & space to envelope & floor
+        mark_abs  = std::min(mark_abs, m_mark_env);
+        mark_abs  = std::max(mark_abs, noise_floor);
+
+        space_abs = std::min(space_abs, m_space_env);
+        space_abs = std::max(space_abs, noise_floor);
+
+        // Mark-space discriminator with automatic threshold correction
+        // (W7AY ATC algorithm: http://www.w7ay.net/site/Technical/ATC/)
+        double logic_level =
+            (mark_abs - noise_floor) * (m_mark_env - noise_floor) -
+            (space_abs - noise_floor) * (m_space_env - noise_floor) -
+            0.5 * ((m_mark_env - noise_floor) * (m_mark_env - noise_floor) -
+                   (m_space_env - noise_floor) * (m_space_env - noise_floor));
+
+        // Logarithmic weighting — tells bit sync which samples are
+        // decoded well vs poorly, helping fish signals out of noise
+        int mark_state = static_cast<int>(log(1.0 + fabs(logic_level)));
+        if (logic_level < 0)
+            mark_state = -mark_state;
+
+        m_early_accumulator  += mark_state;
+        m_prompt_accumulator += mark_state;
+        m_late_accumulator   += mark_state;
+
+        // Accumulate signal magnitude for RSSI while receiving
+        if (m_gotSOP) {
+            double magsq = mark_abs * mark_abs + space_abs * space_abs;
+            m_rssiMagSqSum += magsq;
+            m_rssiMagSqCount++;
+        }
+
+        // Early / late / prompt sampling for multicorrelator
+        if (m_sample_count >= m_next_early_event) {
+            m_average_early_signal = decayavg(
+                m_average_early_signal,
+                fabs(m_early_accumulator), 64);
+            m_next_early_event += m_bit_sample_count;
+            m_early_accumulator = 0;
+        }
+
+        if (m_sample_count >= m_next_late_event) {
+            m_average_late_signal = decayavg(
+                m_average_late_signal,
+                fabs(m_late_accumulator), 64);
+            m_next_late_event += m_bit_sample_count;
+            m_late_accumulator = 0;
+        }
+
+        // Prompt event — the end of a signal pulse where the
+        // accumulator should be at maximum deviation
+        m_pulse_edge_event = m_sample_count >= m_next_prompt_event;
+        if (m_pulse_edge_event) {
+            m_average_prompt_signal = decayavg(
+                m_average_prompt_signal,
+                fabs(m_prompt_accumulator), 64);
+            m_next_prompt_event += m_bit_sample_count;
+            m_averaged_mark_state = static_cast<int>(m_prompt_accumulator);
+            m_prompt_accumulator = 0;
+        }
+
+        // On each prompt event, we have a new bit decision
+        if (m_pulse_edge_event) {
+            handle_bit_value(m_averaged_mark_state);
+        }
+
+        m_sample_count++;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Multicorrelator — adjusts sampling timing to track the signal
+// Identical to navtex_rx::process_multicorrelator()
+// -----------------------------------------------------------------------
+void dsc_rx::process_multicorrelator()
+{
+    // Adjust the sampling period once every 8 bit periods
+    if (m_sample_count % static_cast<int>(m_bit_sample_count * 8))
+        return;
+
+    // Calculate the slope between early and late signals
+    double slope = m_average_late_signal - m_average_early_signal;
+
+    if (m_average_prompt_signal * 1.05 < m_average_early_signal &&
+        m_average_prompt_signal * 1.05 < m_average_late_signal) {
+        // At a signal minimum — get out quickly
+        if (m_average_early_signal > m_average_late_signal) {
+            // Move prompt to where early is
+            slope = m_next_early_event - m_next_prompt_event;
+            slope = fmod(slope - m_bit_sample_count, m_bit_sample_count);
+            m_average_late_signal   = m_average_prompt_signal;
+            m_average_prompt_signal = m_average_early_signal;
+        } else {
+            // Move prompt to where late is
+            slope = m_next_late_event - m_next_prompt_event;
+            slope = fmod(slope + m_bit_sample_count, m_bit_sample_count);
+            m_average_early_signal  = m_average_prompt_signal;
+            m_average_prompt_signal = m_average_late_signal;
+        }
+    } else {
+        slope /= 1024.0;
+    }
+
+    if (slope != 0.0) {
+        m_next_early_event  += slope;
+        m_next_prompt_event += slope;
+        m_next_late_event   += slope;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Envelope / noise decay functions (from navtex_rx)
+// -----------------------------------------------------------------------
+double dsc_rx::envelope_decay(double avg, double value)
+{
+    int divisor;
+    if (value > avg)
+        divisor = static_cast<int>(m_bit_sample_count / 4);
+    else
+        divisor = static_cast<int>(m_bit_sample_count * 16);
+    return decayavg(avg, value, divisor);
+}
+
+double dsc_rx::noise_decay(double avg, double value)
+{
+    int divisor;
+    if (value < avg)
+        divisor = static_cast<int>(m_bit_sample_count / 4);
+    else
+        divisor = static_cast<int>(m_bit_sample_count * 48);
+    return decayavg(avg, value, divisor);
+}
+
+// -----------------------------------------------------------------------
+// handle_bit_value — converts accumulator value to a bit decision
+// and feeds it into the DSC bit processor
+// -----------------------------------------------------------------------
+void dsc_rx::handle_bit_value(int accumulator)
+{
+    // Positive accumulator = mark = 1, negative = space = 0
+    bool bit = (accumulator > 0);
+    receiveBit(bit);
+}
+
+// -----------------------------------------------------------------------
+// receiveBit — DSC-specific bit processing
+// Adapted from SDRangel DSCDemodSink::receiveBit()
+//
+// Before phasing: accumulate bits and check every bit against the
+// 30-bit phasing pattern table (3 consecutive 10-bit symbols).
+// After phasing: every 10 bits, feed into DSCDecoder::decodeBits().
+// When the decoder signals message complete, construct DSCMessage
+// and invoke the callback.
+// -----------------------------------------------------------------------
+void dsc_rx::receiveBit(bool bit)
+{
+    // Store in shift register
+    m_bits = (m_bits << 1) | (bit ? 1u : 0u);
+    m_bitCount++;
+
+    if (!m_gotSOP) {
+        // --- Phasing detection ---
+        // Need at least 30 bits (3 × 10-bit symbols) to match
+        if (m_bitCount >= 10 * 3) {
+            // Check every bit position against phasing patterns
+            // (decrement bitCount so we slide by 1 bit each time)
+            m_bitCount = 10 * 3 - 1;
+
+            unsigned int pat = m_bits & 0x3FFFFFFFu;  // 30 bits
+            for (int i = 0; i < DSCDecoder::m_phasingPatternsSize; i++) {
+                if (pat == DSCDecoder::m_phasingPatterns[i].m_pattern) {
+                    m_dscDecoder.init(DSCDecoder::m_phasingPatterns[i].m_offset);
+                    m_gotSOP   = true;
+                    m_bitCount = 0;
+
+                    // Start RSSI accumulation
+                    m_rssiMagSqSum   = 0.0;
+                    m_rssiMagSqCount = 0;
+                    break;
+                }
+            }
+        }
+    } else {
+        // --- Symbol decoding ---
+        // Every 10 bits, extract a symbol and feed to the decoder
+        if (m_bitCount == 10) {
+            if (m_dscDecoder.decodeBits(m_bits & 0x3FFu)) {
+                // Message complete — extract and deliver
+                std::vector<unsigned char> bytes = m_dscDecoder.getMessage();
+                int errors = m_dscDecoder.getErrors();
+
+                // Compute average RSSI in dB
+                float rssi = -100.0f;  // default if no samples
+                if (m_rssiMagSqCount > 0) {
+                    double avgMagSq = m_rssiMagSqSum / m_rssiMagSqCount;
+                    if (avgMagSq > 0.0)
+                        rssi = static_cast<float>(10.0 * log10(avgMagSq));
+                }
+
+                // Construct DSCMessage and invoke callback
+                time_t now = time(nullptr);
+                DSCMessage message(bytes, now);
+
+                if (m_callback) {
+                    m_callback(message, errors, rssi);
+                }
+
+                // Reset for next message
+                init();
+            }
+            m_bitCount = 0;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// getStats — return current decoder statistics for web UI
+// -----------------------------------------------------------------------
+dsc_rx::DecoderStats dsc_rx::getStats() const
+{
+    DecoderStats s;
+    s.signal_level = m_average_prompt_signal;
+    s.mark_level   = m_mark_env;
+    s.space_level  = m_space_env;
+    s.receiving    = m_gotSOP;
+    s.bit_count    = m_bitCount;
+
+    if (m_gotSOP && m_rssiMagSqCount > 0) {
+        double avgMagSq = m_rssiMagSqSum / m_rssiMagSqCount;
+        s.rssi_db = (avgMagSq > 0.0) ? 10.0 * log10(avgMagSq) : -100.0;
+    } else {
+        s.rssi_db = -100.0;
+    }
+
+    return s;
+}

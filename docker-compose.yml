@@ -1,0 +1,19 @@
+services:
+  ubersdr_dsc:
+    container_name: dsc
+    image: madpsy/ubersdr_dsc:latest
+    restart: unless-stopped
+    environment:
+      # UberSDR base URL
+      UBERSDR_URL: "http://ubersdr:8080"
+      # DSC frequencies in Hz (comma-separated; 2187500 = international distress)
+      DSC_FREQS: "2187500"
+      # Uncomment and set as needed:
+      # WEB_PORT: "6093"
+    networks:
+      - sdr-network
+
+networks:
+  sdr-network:
+    external: true
+    name: ubersdr_sdr-network

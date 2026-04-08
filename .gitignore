@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+cmake-build-*/
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+*.out
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Plans (development notes)
+plans/
