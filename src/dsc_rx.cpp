@@ -108,8 +108,12 @@ void SimpleLowpass::create(int nTaps, double sampleRate, double cutoff)
 
     for (auto &t : m_taps) t /= sum;
 
-    // Circular buffer — same size as tap storage
-    m_buf.assign(halfTaps, cmplx(0.0, 0.0));
+    // Circular buffer — must hold the FULL nTaps samples (not just halfTaps).
+    // SDRangel's FirFilter<T>::init(nTaps) does: m_samples.resize(nTaps).
+    // The symmetric convolution walks pointers a (backward) and b (forward)
+    // across the full nTaps-sample history; with only halfTaps entries the
+    // pointers collide after ~75 steps and the filter is completely wrong.
+    m_buf.assign(nTaps, cmplx(0.0, 0.0));
     m_ptr = 0;
 }
 
