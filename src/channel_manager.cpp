@@ -496,7 +496,12 @@ void ChannelManager::channelLoop(Channel* ch)
     PcmMeta              meta;
     std::vector<uint8_t> decomp_buf;
     std::vector<int16_t> pcm_le;
-    int                  current_sample_rate = 12000; /* default, updated from PCM header */
+    /* mode=iq always delivers 10000 Hz, 2-channel CS16.
+     * Initialise to the known values so minimal-header packets (which do not
+     * carry sample-rate or channel-count) are handled correctly from the very
+     * first frame. */
+    int                  current_sample_rate = 10000;
+    meta.channels = 2;
 
     /* Short label used in debug log lines, e.g. "16.8060 MHz" */
     char ch_label_buf[32];
@@ -634,9 +639,12 @@ void ChannelManager::channelLoop(Channel* ch)
                         }
 
                         /* Feed IQ samples to the DSC decoder.
-                         * IQ mode: pcm_le contains interleaved CS16 pairs (I, Q, I, Q, ...).
-                         * process() takes the number of IQ *pairs*, not raw int16 count. */
-                        if (!pcm_le.empty() && meta.channels == 2) {
+                         * mode=iq always delivers 2-channel CS16 at 10000 Hz.
+                         * pcm_le contains interleaved pairs (I, Q, I, Q, ...).
+                         * process() takes the number of IQ *pairs*, not raw int16 count.
+                         * Note: meta.channels is pre-initialised to 2 above so this
+                         * guard works correctly even for minimal-header frames. */
+                        if (!pcm_le.empty()) {
                             int nb_pairs = (int)(pcm_le.size() / 2);
                             ch->decoder->process(pcm_le.data(), nb_pairs);
 
