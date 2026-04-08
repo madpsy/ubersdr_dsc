@@ -178,7 +178,7 @@ void dsc_rx::process(const float * data, int nb_samples)
     for (int i = 0; i < nb_samples; i++) {
         // Scale float [-1,1] to int16 range, same as navtex_rx
         double dv = 32767.0 * data[i];
-        z = cmplx(dv, dv);
+        z = cmplx(dv, 0);
 
         zmark = mixer(m_mark_phase, m_mark_f, z);
         m_mark_lowpass->run(zmark, &zp_mark);
@@ -196,7 +196,7 @@ void dsc_rx::process(const int16_t * data, int nb_samples)
     cmplx z, zmark, zspace, *zp_mark, *zp_space;
 
     for (int i = 0; i < nb_samples; i++) {
-        z = cmplx(data[i], data[i]);
+        z = cmplx(data[i], 0);
 
         zmark = mixer(m_mark_phase, m_mark_f, z);
         m_mark_lowpass->run(zmark, &zp_mark);
