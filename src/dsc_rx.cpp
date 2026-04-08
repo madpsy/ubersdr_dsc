@@ -82,29 +82,19 @@ dsc_rx::dsc_rx(int sample_rate, MessageCallback callback,
     double bit_duration_seconds = 1.0 / m_baud_rate;
     m_bit_sample_count = m_sample_rate * bit_duration_seconds;
 
-    m_sample_count = 0;
-
-    // Multicorrelator — spread of 1/5 bit period
-    m_early_accumulator  = 0;
-    m_prompt_accumulator = 0;
-    m_late_accumulator   = 0;
-
-    m_next_early_event  = 0;
-    m_next_prompt_event = m_bit_sample_count / 5;
-    m_next_late_event   = m_bit_sample_count * 2 / 5;
-
-    m_average_early_signal  = 0;
-    m_average_prompt_signal = 0;
-    m_average_late_signal   = 0;
-
-    m_pulse_edge_event    = false;
-    m_averaged_mark_state = 0;
+    // Edge-triggered clock — initialise to -half_bit so the first sample
+    // fires after one full bit period (matches SDRangel init())
+    m_clockCount = -m_bit_sample_count / 2.0;
+    m_data     = false;
+    m_dataPrev = false;
 
     // Envelope / ATC state — per-instance (not static like navtex_rx)
+    // Initialise noise floor to a small non-zero value to avoid the ATC
+    // formula producing garbage during the FFT filter startup transient.
     m_mark_env    = 0;
     m_space_env   = 0;
-    m_mark_noise  = 0;
-    m_space_noise = 0;
+    m_mark_noise  = 1.0;
+    m_space_noise = 1.0;
 
     // DSC-specific state
     m_bits     = 0;
@@ -142,6 +132,11 @@ void dsc_rx::init()
 
     m_rssiMagSqSum   = 0.0;
     m_rssiMagSqCount = 0;
+
+    // Reset clock so the next bit fires after one full bit period
+    m_clockCount = -m_bit_sample_count / 2.0;
+    m_data     = false;
+    m_dataPrev = false;
 }
 
 // -----------------------------------------------------------------------
@@ -233,8 +228,6 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
         double mark_abs  = std::abs(zp_mark[i]);
         double space_abs = std::abs(zp_space[i]);
 
-        process_multicorrelator();
-
         // Determine noise floor & envelope for mark & space
         m_mark_env   = envelope_decay(m_mark_env, mark_abs);
         m_mark_noise = noise_decay(m_mark_noise, mark_abs);
@@ -259,15 +252,9 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
             0.5 * ((m_mark_env - noise_floor) * (m_mark_env - noise_floor) -
                    (m_space_env - noise_floor) * (m_space_env - noise_floor));
 
-        // Logarithmic weighting — tells bit sync which samples are
-        // decoded well vs poorly, helping fish signals out of noise
-        int mark_state = static_cast<int>(log(1.0 + fabs(logic_level)));
-        if (logic_level < 0)
-            mark_state = -mark_state;
-
-        m_early_accumulator  += mark_state;
-        m_prompt_accumulator += mark_state;
-        m_late_accumulator   += mark_state;
+        // Demodulated bit decision: positive logic_level = mark = 1
+        m_dataPrev = m_data;
+        m_data     = (logic_level > 0.0);
 
         // Accumulate signal magnitude for RSSI while receiving
         if (m_gotSOP) {
@@ -276,41 +263,26 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
             m_rssiMagSqCount++;
         }
 
-        // Early / late / prompt sampling for multicorrelator
-        if (m_sample_count >= m_next_early_event) {
-            m_average_early_signal = decayavg(
-                m_average_early_signal,
-                fabs(m_early_accumulator), 64);
-            m_next_early_event += m_bit_sample_count;
-            m_early_accumulator = 0;
+        // ---------------------------------------------------------------
+        // Edge-triggered clock recovery (SDRangel style)
+        //
+        // On each 0→1 data transition we expect m_clockCount to be near
+        // zero (start of a new bit).  Pull the clock 25% toward zero to
+        // track the signal timing.  Then advance the clock by one sample;
+        // when it reaches samplesPerBit/2 - 1 we are in the middle of the
+        // bit — sample it and wrap the counter back by one full bit period.
+        // ---------------------------------------------------------------
+        if (m_data && !m_dataPrev) {
+            m_clockCount -= m_clockCount * 0.25;
         }
 
-        if (m_sample_count >= m_next_late_event) {
-            m_average_late_signal = decayavg(
-                m_average_late_signal,
-                fabs(m_late_accumulator), 64);
-            m_next_late_event += m_bit_sample_count;
-            m_late_accumulator = 0;
+        m_clockCount += 1.0;
+        if (m_clockCount >= m_bit_sample_count / 2.0 - 1.0) {
+            // Sample in the middle of the bit
+            handle_bit_value(m_data);
+            m_clockCount -= m_bit_sample_count;
         }
 
-        // Prompt event — the end of a signal pulse where the
-        // accumulator should be at maximum deviation
-        m_pulse_edge_event = m_sample_count >= m_next_prompt_event;
-        if (m_pulse_edge_event) {
-            m_average_prompt_signal = decayavg(
-                m_average_prompt_signal,
-                fabs(m_prompt_accumulator), 64);
-            m_next_prompt_event += m_bit_sample_count;
-            m_averaged_mark_state = static_cast<int>(m_prompt_accumulator);
-            m_prompt_accumulator = 0;
-        }
-
-        // On each prompt event, we have a new bit decision
-        if (m_pulse_edge_event) {
-            handle_bit_value(m_averaged_mark_state);
-        }
-
-        m_sample_count++;
         m_dbg_sample_count++;
 
         // Periodic stats dump — one line per channel every 30 s
@@ -320,53 +292,13 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
             m_dbg_stats_sample = m_dbg_sample_count;
             fprintf(stderr,
                 "[DSC-DBG] %-14s  mark_env=%.1f  space_env=%.1f"
-                "  signal=%.1f  bits=%lld  sop=%s\n",
+                "  clock=%.1f  bits=%lld  sop=%s\n",
                 m_dbg_label.c_str(),
                 m_mark_env, m_space_env,
-                m_average_prompt_signal,
+                m_clockCount,
                 m_dbg_total_bits,
                 m_gotSOP ? "YES" : "no");
         }
-    }
-}
-
-// -----------------------------------------------------------------------
-// Multicorrelator — adjusts sampling timing to track the signal
-// Identical to navtex_rx::process_multicorrelator()
-// -----------------------------------------------------------------------
-void dsc_rx::process_multicorrelator()
-{
-    // Adjust the sampling period once every 8 bit periods
-    if (m_sample_count % static_cast<int>(m_bit_sample_count * 8))
-        return;
-
-    // Calculate the slope between early and late signals
-    double slope = m_average_late_signal - m_average_early_signal;
-
-    if (m_average_prompt_signal * 1.05 < m_average_early_signal &&
-        m_average_prompt_signal * 1.05 < m_average_late_signal) {
-        // At a signal minimum — get out quickly
-        if (m_average_early_signal > m_average_late_signal) {
-            // Move prompt to where early is
-            slope = m_next_early_event - m_next_prompt_event;
-            slope = fmod(slope - m_bit_sample_count, m_bit_sample_count);
-            m_average_late_signal   = m_average_prompt_signal;
-            m_average_prompt_signal = m_average_early_signal;
-        } else {
-            // Move prompt to where late is
-            slope = m_next_late_event - m_next_prompt_event;
-            slope = fmod(slope + m_bit_sample_count, m_bit_sample_count);
-            m_average_early_signal  = m_average_prompt_signal;
-            m_average_prompt_signal = m_average_late_signal;
-        }
-    } else {
-        slope /= 1024.0;
-    }
-
-    if (slope != 0.0) {
-        m_next_early_event  += slope;
-        m_next_prompt_event += slope;
-        m_next_late_event   += slope;
     }
 }
 
@@ -394,13 +326,10 @@ double dsc_rx::noise_decay(double avg, double value)
 }
 
 // -----------------------------------------------------------------------
-// handle_bit_value — converts accumulator value to a bit decision
-// and feeds it into the DSC bit processor
+// handle_bit_value — feeds a demodulated bit into the DSC bit processor
 // -----------------------------------------------------------------------
-void dsc_rx::handle_bit_value(int accumulator)
+void dsc_rx::handle_bit_value(bool bit)
 {
-    // Positive accumulator = mark = 1, negative = space = 0
-    bool bit = (accumulator > 0);
     m_dbg_total_bits++;
     receiveBit(bit);
 }
@@ -511,7 +440,7 @@ void dsc_rx::receiveBit(bool bit)
 dsc_rx::DecoderStats dsc_rx::getStats() const
 {
     DecoderStats s;
-    s.signal_level = m_average_prompt_signal;
+    s.signal_level = m_mark_env - m_space_env;  // positive = mark dominant
     s.mark_level   = m_mark_env;
     s.space_level  = m_space_env;
     s.receiving    = m_gotSOP;

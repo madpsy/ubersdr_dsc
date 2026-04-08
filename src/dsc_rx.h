@@ -65,22 +65,15 @@ private:
     fftfilt *m_space_lowpass;
 
     double m_bit_sample_count;   // samples per bit (fractional)
-    int    m_sample_count;
 
-    // Multicorrelator bit synchronization
-    double m_early_accumulator;
-    double m_prompt_accumulator;
-    double m_late_accumulator;
-
-    double m_next_early_event;
-    double m_next_prompt_event;
-    double m_next_late_event;
-    double m_average_early_signal;
-    double m_average_prompt_signal;
-    double m_average_late_signal;
-
-    bool m_pulse_edge_event;
-    int  m_averaged_mark_state;
+    // Edge-triggered clock recovery (SDRangel style)
+    // m_clockCount counts samples within a bit period.
+    // Initialised to -m_bit_sample_count/2 so the first bit fires after
+    // one full bit period.  On each 0→1 data transition the count is
+    // pulled 25% toward zero to track the signal timing.
+    double m_clockCount;
+    bool   m_data;       // current demodulated bit (post-ATC)
+    bool   m_dataPrev;   // previous demodulated bit (for edge detection)
 
     // Envelope / ATC state (per-instance, not static)
     double m_mark_env;
@@ -119,12 +112,11 @@ private:
     // DSP pipeline
     cmplx mixer(double & phase, double f, cmplx in);
     void process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples);
-    void process_multicorrelator();
     double envelope_decay(double avg, double value);
     double noise_decay(double avg, double value);
 
     // Bit-level processing
-    void handle_bit_value(int accumulator);
+    void handle_bit_value(bool bit);
     void receiveBit(bool bit);
 
     // Reset decoder state
