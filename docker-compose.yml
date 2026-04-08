@@ -7,7 +7,7 @@ services:
       # UberSDR base URL
       UBERSDR_URL: "http://ubersdr:8080"
       # DSC frequencies in Hz (comma-separated).
-      # If not set, all 25 ITU DSC frequencies are monitored by default.
+      # If not set, all 26 ITU DSC frequencies are monitored by default.
       # Uncomment to restrict to specific frequencies:
       # DSC_FREQS: "2187500,8414500"
       # Uncomment and set as needed:

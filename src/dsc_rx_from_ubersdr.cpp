@@ -50,7 +50,7 @@ static std::vector<int64_t> get_default_dsc_frequencies()
     std::vector<int64_t> freqs = {
         2177000, 2189500,
         4208000, 4208500, 4209000,
-        6312500, 6313000,
+        6312500, 6313000, 6313500,
         8415000, 8415500, 8416000,
         12577500, 12578000, 12578500,
         16805000, 16805500, 16806000,
@@ -294,7 +294,7 @@ int main(int argc, const char **argv)
                 "  --sdr-url URL    ubersdr server base URL (default: http://localhost:8073)\n"
                 "  --web-port N     local web UI port (default: 6093)\n"
                 "  --freqs f1,f2    comma-separated frequencies in Hz\n"
-                "                   (default: all 25 ITU DSC frequencies)\n"
+                "                   (default: all 26 ITU DSC frequencies)\n"
                 "\n"
                 "Examples:\n"
                 "  %s --sdr-url http://192.168.1.10:8073\n"
