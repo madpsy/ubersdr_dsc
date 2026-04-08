@@ -14,6 +14,7 @@
 #include <complex>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 #include "dsc_decoder.h"
 #include "dsc_message.h"
@@ -25,7 +26,10 @@ class dsc_rx {
 public:
     using MessageCallback = std::function<void(const DSCMessage& msg, int errors, float rssi)>;
 
-    dsc_rx(int sample_rate, MessageCallback callback);
+    // label is a short string identifying this channel (e.g. "16.806 MHz")
+    // used as a prefix in debug log lines so 25 channels can be told apart
+    dsc_rx(int sample_rate, MessageCallback callback,
+           const std::string &label = "");
     ~dsc_rx();
 
     // Feed audio samples — main entry point
@@ -97,6 +101,14 @@ private:
 
     // Callback for decoded messages
     MessageCallback m_callback;
+
+    // ---- Debug / diagnostics ----
+
+    std::string m_dbg_label;          // channel label for log lines
+    long long   m_dbg_sample_count;   // total samples seen (for periodic stats)
+    long long   m_dbg_total_bits;     // total bits produced (confirms bit flow)
+    long long   m_dbg_near_miss_sample; // sample count at last near-miss log
+    long long   m_dbg_stats_sample;   // sample count at last stats dump
 
     // ---- Private methods ----
 

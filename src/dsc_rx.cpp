@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <cstdio>
 
 // DSC / NAVTEX share these RF parameters
 static const int    deviation_f       = 85;       // ±85 Hz = 170 Hz shift
@@ -50,9 +51,30 @@ static const double dflt_center_freq  = 500.0;    // audio center frequency
 // -----------------------------------------------------------------------
 // Constructor
 // -----------------------------------------------------------------------
-dsc_rx::dsc_rx(int sample_rate, MessageCallback callback)
+// Periodic stats interval: every 30 seconds worth of samples
+static const long long DBG_STATS_INTERVAL  = 30LL * 12000;  // scaled at runtime
+// Near-miss rate limit: at most once per 10 seconds worth of samples
+static const long long DBG_NEARMISS_INTERVAL = 10LL * 12000; // scaled at runtime
+
+// Hamming distance between two 30-bit words
+static int hamming30(unsigned int a, unsigned int b)
+{
+    unsigned int x = (a ^ b) & 0x3FFFFFFFu;
+    // popcount via Brian Kernighan
+    int n = 0;
+    while (x) { x &= x - 1; n++; }
+    return n;
+}
+
+dsc_rx::dsc_rx(int sample_rate, MessageCallback callback,
+               const std::string &label)
     : m_sample_rate(sample_rate),
-      m_callback(std::move(callback))
+      m_callback(std::move(callback)),
+      m_dbg_label(label),
+      m_dbg_sample_count(0),
+      m_dbg_total_bits(0),
+      m_dbg_near_miss_sample(-1000000LL),
+      m_dbg_stats_sample(0)
 {
     m_center_frequency_f = dflt_center_freq;
     m_baud_rate = 100.0;
@@ -289,6 +311,22 @@ void dsc_rx::process_fft_output(cmplx * zp_mark, cmplx * zp_space, int samples)
         }
 
         m_sample_count++;
+        m_dbg_sample_count++;
+
+        // Periodic stats dump — one line per channel every 30 s
+        long long stats_interval = (long long)(DBG_STATS_INTERVAL /
+                                               12000.0 * m_sample_rate);
+        if (m_dbg_sample_count - m_dbg_stats_sample >= stats_interval) {
+            m_dbg_stats_sample = m_dbg_sample_count;
+            fprintf(stderr,
+                "[DSC-DBG] %-14s  mark_env=%.1f  space_env=%.1f"
+                "  signal=%.1f  bits=%lld  sop=%s\n",
+                m_dbg_label.c_str(),
+                m_mark_env, m_space_env,
+                m_average_prompt_signal,
+                m_dbg_total_bits,
+                m_gotSOP ? "YES" : "no");
+        }
     }
 }
 
@@ -363,6 +401,7 @@ void dsc_rx::handle_bit_value(int accumulator)
 {
     // Positive accumulator = mark = 1, negative = space = 0
     bool bit = (accumulator > 0);
+    m_dbg_total_bits++;
     receiveBit(bit);
 }
 
@@ -391,16 +430,45 @@ void dsc_rx::receiveBit(bool bit)
             m_bitCount = 10 * 3 - 1;
 
             unsigned int pat = m_bits & 0x3FFFFFFFu;  // 30 bits
-            for (int i = 0; i < DSCDecoder::m_phasingPatternsSize; i++) {
-                if (pat == DSCDecoder::m_phasingPatterns[i].m_pattern) {
-                    m_dscDecoder.init(DSCDecoder::m_phasingPatterns[i].m_offset);
-                    m_gotSOP   = true;
-                    m_bitCount = 0;
 
-                    // Start RSSI accumulation
-                    m_rssiMagSqSum   = 0.0;
-                    m_rssiMagSqCount = 0;
-                    break;
+            // Find best-matching phasing pattern (for near-miss logging)
+            int best_dist = 31;
+            int best_idx  = -1;
+            for (int i = 0; i < DSCDecoder::m_phasingPatternsSize; i++) {
+                int d = hamming30(pat, DSCDecoder::m_phasingPatterns[i].m_pattern);
+                if (d < best_dist) { best_dist = d; best_idx = i; }
+                if (d == 0) break;  // exact match — stop early
+            }
+
+            if (best_dist == 0) {
+                // Exact phasing pattern match
+                m_dscDecoder.init(DSCDecoder::m_phasingPatterns[best_idx].m_offset);
+                m_gotSOP   = true;
+                m_bitCount = 0;
+
+                // Start RSSI accumulation
+                m_rssiMagSqSum   = 0.0;
+                m_rssiMagSqCount = 0;
+
+                fprintf(stderr,
+                    "[DSC-DBG] %-14s  PHASING LOCK  pat[%d]=0x%08X"
+                    "  offset=%d  bits=%lld\n",
+                    m_dbg_label.c_str(), best_idx,
+                    DSCDecoder::m_phasingPatterns[best_idx].m_pattern,
+                    DSCDecoder::m_phasingPatterns[best_idx].m_offset,
+                    m_dbg_total_bits);
+            } else if (best_dist <= 3) {
+                // Near-miss — rate-limited to once per 10 s
+                long long nm_interval = (long long)(DBG_NEARMISS_INTERVAL /
+                                                    12000.0 * m_sample_rate);
+                if (m_dbg_sample_count - m_dbg_near_miss_sample >= nm_interval) {
+                    m_dbg_near_miss_sample = m_dbg_sample_count;
+                    fprintf(stderr,
+                        "[DSC-DBG] %-14s  near-miss  got=0x%08X"
+                        "  best=0x%08X  dist=%d  bits=%lld\n",
+                        m_dbg_label.c_str(), pat,
+                        DSCDecoder::m_phasingPatterns[best_idx].m_pattern,
+                        best_dist, m_dbg_total_bits);
                 }
             }
         }

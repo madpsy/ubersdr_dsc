@@ -498,6 +498,12 @@ void ChannelManager::channelLoop(Channel* ch)
     std::vector<int16_t> pcm_le;
     int                  current_sample_rate = 12000; /* default, updated from PCM header */
 
+    /* Short label used in debug log lines, e.g. "16.8060 MHz" */
+    char ch_label_buf[32];
+    snprintf(ch_label_buf, sizeof(ch_label_buf), "%.4f MHz",
+             ch->frequency_hz / 1e6);
+    std::string ch_label(ch_label_buf);
+
     /* Create the decoder with default sample rate; will be recreated if rate changes */
     auto message_cb = [this, ch](const DSCMessage& msg, int errors, float rssi) {
         DecodedMessage dm{msg, errors, rssi, ch->frequency_hz, std::time(nullptr)};
@@ -524,7 +530,7 @@ void ChannelManager::channelLoop(Channel* ch)
             m_on_message(dm);
     };
 
-    ch->decoder = std::make_unique<dsc_rx>(current_sample_rate, message_cb);
+    ch->decoder = std::make_unique<dsc_rx>(current_sample_rate, message_cb, ch_label);
 
     /* Build WebSocket base URL */
     std::string ws_base = http_to_ws(m_base_url);
@@ -622,7 +628,7 @@ void ChannelManager::channelLoop(Channel* ch)
                                     (long long)ch->frequency_hz, meta.sample_rate);
                             current_sample_rate = (int)meta.sample_rate;
                             ch->decoder = std::make_unique<dsc_rx>(
-                                current_sample_rate, message_cb);
+                                current_sample_rate, message_cb, ch_label);
                         }
 
                         /* Feed PCM samples to the DSC decoder */
