@@ -251,6 +251,25 @@ void dsc_rx::process(const int16_t *iq_data, int nb_samples)
         processOneSample(cmplx(I, Q));
         m_dbg_sample_count++;
     }
+
+    // One diagnostic line per channel every 30 s (300000 IQ pairs at 10000 Hz).
+    // Diagnosis:
+    //   mark=0 space=0  → no IQ arriving, or exp table wrong
+    //   mark>0 space>0  → signal present, ATC working
+    //   diff≈0          → no FSK visible (wrong frequency or no signal)
+    //   diff≠0          → FSK visible, phasing should eventually lock
+    static const long long DIAG_INTERVAL = 300000LL;
+    long long prev = m_dbg_sample_count - (long long)nb_samples;
+    if (m_dbg_sample_count / DIAG_INTERVAL != prev / DIAG_INTERVAL) {
+        fprintf(stderr,
+            "[DSC] %-14s  t=%llds  mark=%.4f  space=%.4f  diff=%.4f  sop=%s\n",
+            m_dbg_label.c_str(),
+            (long long)(m_dbg_sample_count / 10000),
+            m_markEnv, m_spaceEnv,
+            m_markEnv - m_spaceEnv,
+            m_gotSOP ? "YES" : "no");
+        fflush(stderr);
+    }
 }
 
 // -----------------------------------------------------------------------
