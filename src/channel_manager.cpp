@@ -553,13 +553,15 @@ void ChannelManager::channelLoop(Channel* ch)
         }
 
         /* 2. Build WebSocket URL
-         * dial_hz = frequency_hz - 500 (USB mode, DSC audio center at 500 Hz) */
-        int64_t dial_hz = ch->frequency_hz - 500;
+         * IQ mode: tune to DSC center frequency, 10 kHz bandwidth.
+         * ubersdr delivers CS16 (little-endian interleaved I/Q int16) at 10000 Hz.
+         * The DSC mark tone (+85 Hz) and space tone (-85 Hz) are present as
+         * complex exponentials relative to the tuned centre. */
+        int64_t dial_hz = ch->frequency_hz;  // tune to DSC centre directly
 
         char ws_url[1024];
         snprintf(ws_url, sizeof(ws_url),
-                 "%s/ws?frequency=%lld&mode=usb"
-                 "&bandwidthLow=50&bandwidthHigh=2700"
+                 "%s/ws?frequency=%lld&mode=iq"
                  "&format=pcm-zstd&version=2"
                  "&user_session_id=%s",
                  ws_base.c_str(), (long long)dial_hz, ch->session_id.c_str());
@@ -631,11 +633,14 @@ void ChannelManager::channelLoop(Channel* ch)
                                 current_sample_rate, message_cb, ch_label);
                         }
 
-                        /* Feed PCM samples to the DSC decoder */
-                        if (!pcm_le.empty()) {
-                            ch->decoder->process(pcm_le.data(), (int)pcm_le.size());
+                        /* Feed IQ samples to the DSC decoder.
+                         * IQ mode: pcm_le contains interleaved CS16 pairs (I, Q, I, Q, ...).
+                         * process() takes the number of IQ *pairs*, not raw int16 count. */
+                        if (!pcm_le.empty() && meta.channels == 2) {
+                            int nb_pairs = (int)(pcm_le.size() / 2);
+                            ch->decoder->process(pcm_le.data(), nb_pairs);
 
-                            /* Forward decoded PCM to audio callback (for web UI preview) */
+                            /* Forward raw IQ to audio callback (for web UI preview) */
                             if (m_on_audio)
                                 m_on_audio(ch->frequency_hz, pcm_le);
                         }

@@ -1,5 +1,4 @@
 add_library(libdsc SHARED
-    fftfilt.cxx
     dsc_rx.cpp
     dsc_decoder.cpp
     dsc_message.cpp

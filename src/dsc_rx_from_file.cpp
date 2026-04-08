@@ -226,10 +226,11 @@ int main(int argc, const char **argv)
         if (nread == 0)
             break;
 
-        int nb_samples = nread / sizeof(int16_t);
-        total_samples += nb_samples;
+        int nb_int16 = nread / sizeof(int16_t);
+        total_samples += nb_int16;
 
-        rx.process(inbuf, nb_samples);
+        /* process() expects CS16 interleaved I/Q pairs */
+        rx.process(inbuf, nb_int16 / 2);
 
         if (verbose && (total_samples % (sample_rate * 10) < BUFSIZE)) {
             double seconds = (double)total_samples / sample_rate;
