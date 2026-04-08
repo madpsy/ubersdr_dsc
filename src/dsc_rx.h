@@ -33,18 +33,22 @@
 typedef std::complex<double> cmplx;
 
 // -----------------------------------------------------------------------
-// FIR lowpass filter for complex samples — circular buffer implementation
-// (mirrors SDRangel's Lowpass<Complex>)
+// FIR lowpass filter for complex samples.
+// Exact port of SDRangel's Lowpass<Complex> + generateLowPassFilter().
+// Uses symmetric half-tap storage and circular buffer.
 // -----------------------------------------------------------------------
 class SimpleLowpass {
 public:
-    void create(int taps, double fc);  // fc normalised 0..0.5
+    // sampleRate: Hz (e.g. 10000)
+    // cutoff:     Hz (e.g. 110 for BAUD_RATE * 1.1)
+    void create(int nTaps, double sampleRate, double cutoff);
     cmplx filter(cmplx in);
 
 private:
-    std::vector<double> m_coeffs;
-    std::vector<cmplx>  m_buf;   // circular buffer
-    int                 m_pos;   // write position
+    // Half-taps (nTaps/2 + 1 entries), matching SDRangel's generateLowPassFilter
+    std::vector<double> m_taps;
+    std::vector<cmplx>  m_buf;   // circular buffer (nTaps/2 + 1 entries)
+    int                 m_ptr;   // write position
 };
 
 // -----------------------------------------------------------------------

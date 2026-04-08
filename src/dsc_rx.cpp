@@ -20,6 +20,10 @@
  *   - Phasing detection: exact 30-bit pattern match
  *   - Symbol decoding: every 10 bits via DSCDecoder
  *
+ * FIR filter: exact port of SDRangel's generateLowPassFilter() +
+ * FirFilter<Complex>::filter() — uses half-tap symmetry optimisation,
+ * absolute Hz cutoff (not normalised), and SDRangel's Blackman window.
+ *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -49,48 +53,97 @@ static const int    SAMPLES_PER_BIT = (DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE
                                       / DSCDEMOD_BAUD_RATE;            // 100
 
 // -----------------------------------------------------------------------
-// SimpleLowpass — windowed-sinc FIR lowpass for complex samples
-// Uses a circular buffer (like SDRangel's Lowpass<Complex>) for efficiency.
+// SimpleLowpass — exact port of SDRangel's generateLowPassFilter() +
+// FirFilter<Complex>::filter().
+//
+// SDRangel stores only the half-taps (nTaps/2 + 1 entries) and exploits
+// the symmetry of a linear-phase FIR:
+//   acc += (samples[a] + samples[b]) * taps[i]   for i = 0..n_taps-1
+//   acc += samples[a] * taps[n_taps]              (centre tap)
+//
+// The tap generator (firfilter.cpp::generateLowPassFilter) uses:
+//   Wc = 2π * cutoff / sampleRate
+//   taps[i] = sin(n * Wc) / (n * π)   (sinc, n = i - halfTaps + 1)
+//   taps[halfTaps-1] = Wc / π          (centre tap, n=0)
+//   Blackman: 0.42 + 0.5*cos(2πn/nTaps) + 0.08*cos(4πn/nTaps)
+//   Normalise: sum = 2 * Σ(taps[0..halfTaps-2]) + taps[halfTaps-1]
 // -----------------------------------------------------------------------
-void SimpleLowpass::create(int taps, double fc)
+void SimpleLowpass::create(int nTaps, double sampleRate, double cutoff)
 {
-    // taps must be odd
-    if (taps % 2 == 0) taps++;
-    int half = taps / 2;
+    // nTaps must be odd
+    if (!(nTaps & 1)) nTaps++;
 
-    m_coeffs.resize(taps);
-    double sum = 0.0;
-    for (int i = 0; i < taps; i++) {
-        int n = i - half;
-        double sinc = (n == 0) ? 1.0
-                                : std::sin(M_PI * n * 2.0 * fc) / (M_PI * n * 2.0 * fc);
-        // Blackman window (same as SDRangel's Lowpass)
-        double w = 0.42 - 0.5 * std::cos(2.0 * M_PI * i / (taps - 1))
-                        + 0.08 * std::cos(4.0 * M_PI * i / (taps - 1));
-        m_coeffs[i] = sinc * w;
-        sum += m_coeffs[i];
+    double Wc       = (2.0 * M_PI * cutoff) / sampleRate;
+    int    halfTaps = nTaps / 2 + 1;   // number of tap entries stored
+
+    m_taps.resize(halfTaps);
+
+    for (int i = 0; i < halfTaps; ++i)
+    {
+        if (i == halfTaps - 1)
+        {
+            // Centre tap (n = 0): sinc(0) = Wc/π
+            m_taps[i] = Wc / M_PI;
+        }
+        else
+        {
+            int n = i - (nTaps - 1) / 2;   // n is negative for i < halfTaps-1
+            m_taps[i] = std::sin(n * Wc) / (n * M_PI);
+        }
     }
-    for (auto &c : m_coeffs) c /= sum;
 
-    // Circular buffer
-    m_buf.assign(taps, cmplx(0.0, 0.0));
-    m_pos = 0;
+    // Blackman window — SDRangel: 0.42 + 0.5*cos(2πn/nTaps) + 0.08*cos(4πn/nTaps)
+    for (int i = 0; i < halfTaps; ++i)
+    {
+        int n = i - (nTaps - 1) / 2;
+        m_taps[i] *= 0.42 + 0.5  * std::cos((2.0 * M_PI * n) / nTaps)
+                          + 0.08 * std::cos((4.0 * M_PI * n) / nTaps);
+    }
+
+    // Normalise: full filter sum = 2 * Σ(half taps except centre) + centre
+    double sum = 0.0;
+    for (int i = 0; i < halfTaps - 1; ++i)
+        sum += m_taps[i] * 2.0;
+    sum += m_taps[halfTaps - 1];
+
+    for (auto &t : m_taps) t /= sum;
+
+    // Circular buffer — same size as tap storage
+    m_buf.assign(halfTaps, cmplx(0.0, 0.0));
+    m_ptr = 0;
 }
 
 cmplx SimpleLowpass::filter(cmplx in)
 {
-    // Write new sample into circular buffer
-    m_buf[m_pos] = in;
-    m_pos = (m_pos + 1) % (int)m_coeffs.size();
+    // Exact port of SDRangel FirFilter<Complex>::filter()
+    // m_taps has halfTaps = nTaps/2 + 1 entries
+    // m_buf  has halfTaps entries (circular)
+    unsigned int n_samples = (unsigned int)m_buf.size();
+    unsigned int n_taps    = (unsigned int)m_taps.size() - 1;  // last tap is centre
 
-    // Convolve: oldest sample is at m_pos, newest is at m_pos-1 (mod size)
-    cmplx out(0.0, 0.0);
-    int sz = (int)m_coeffs.size();
-    for (int i = 0; i < sz; i++) {
-        int idx = (m_pos + i) % sz;
-        out += m_coeffs[i] * m_buf[idx];
+    // Write new sample
+    m_buf[m_ptr] = in;
+
+    unsigned int a = m_ptr;
+    unsigned int b = (a == n_samples - 1) ? 0 : a + 1;
+
+    cmplx acc(0.0, 0.0);
+
+    for (unsigned int i = 0; i < n_taps; ++i)
+    {
+        acc += (m_buf[a] + m_buf[b]) * m_taps[i];
+
+        a = (a == 0)             ? n_samples - 1 : a - 1;
+        b = (b == n_samples - 1) ? 0             : b + 1;
     }
-    return out;
+
+    // Centre tap
+    acc += m_buf[a] * m_taps[n_taps];
+
+    // Advance write pointer
+    m_ptr = (m_ptr == n_samples - 1) ? 0 : m_ptr + 1;
+
+    return acc;
 }
 
 // -----------------------------------------------------------------------
@@ -140,12 +193,15 @@ dsc_rx::dsc_rx(int sample_rate, MessageCallback callback,
     }
     m_expIdx = 0;
 
-    // FIR lowpass at BAUD_RATE * 1.1 = 110 Hz
-    // Normalised cutoff = 110 / (10000) = 0.011
-    // 301 taps — same as SDRangel
-    const double fc = (DSCDEMOD_BAUD_RATE * 1.1) / (double)(DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE);
-    m_lpfMark.create(301, fc);
-    m_lpfSpace.create(301, fc);
+    // FIR lowpass — exact match to SDRangel:
+    //   m_lowpassComplex1.create(301, DSCDEMOD_CHANNEL_SAMPLE_RATE, DSCDEMOD_BAUD_RATE * 1.1)
+    //   = create(301, 1000, 110)
+    // We pass the same absolute Hz values scaled to our sample rate:
+    //   create(301, 10000, 110)
+    // The cutoff in Hz is the same (110 Hz); only sampleRate changes.
+    const double cutoff_hz = DSCDEMOD_BAUD_RATE * 1.1;  // 110 Hz
+    m_lpfMark.create(301, (double)(DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE), cutoff_hz);
+    m_lpfSpace.create(301, (double)(DSCDEMOD_CHANNEL_SAMPLE_RATE * RATE_SCALE), cutoff_hz);
 
     // Moving maximum window = samplesPerBit * 8 (same ratio as SDRangel: 10*8=80 at 1000 Hz)
     m_movMaxMark.setSize(SAMPLES_PER_BIT * 8);
@@ -235,7 +291,6 @@ void dsc_rx::processOneSample(cmplx ci)
     // http://www.w7ay.net/site/Technical/ATC/index.html
     double bias1 = abs1Filt - 0.5 * env1;
     double bias2 = abs2Filt - 0.5 * env2;
-    // double unbiasedData = abs1Filt - abs2Filt;  // (unused, kept for reference)
     double biasedData   = bias1 - bias2;
 
     // Bit decision
