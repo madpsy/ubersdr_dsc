@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/madpsy/ubersdr_dsc/master"
+REPO_RAW="https://raw.githubusercontent.com/madpsy/ubersdr_dsc/main"
 INSTALL_DIR="${HOME}/ubersdr/dsc"
 COMPOSE_FILE="docker-compose.yml"
 FORCE_UPDATE="${FORCE_UPDATE:-0}"

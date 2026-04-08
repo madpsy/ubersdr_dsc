@@ -6,8 +6,10 @@ services:
     environment:
       # UberSDR base URL
       UBERSDR_URL: "http://ubersdr:8080"
-      # DSC frequencies in Hz (comma-separated; 2187500 = international distress)
-      DSC_FREQS: "2187500"
+      # DSC frequencies in Hz (comma-separated).
+      # If not set, all 25 ITU DSC frequencies are monitored by default.
+      # Uncomment to restrict to specific frequencies:
+      # DSC_FREQS: "2187500,8414500"
       # Uncomment and set as needed:
       # WEB_PORT: "6093"
     networks:
