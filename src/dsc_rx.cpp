@@ -370,7 +370,7 @@ void dsc_rx::receiveBit(bool bit)
                     DSCDecoder::m_phasingPatterns[best_idx].m_pattern,
                     DSCDecoder::m_phasingPatterns[best_idx].m_offset,
                     m_dbg_total_bits);
-            } else if (best_dist <= 3) {
+            } else if (best_dist <= 2) {
                 // Near-miss — rate-limited to once per 10 s
                 long long nm_interval = (long long)(DBG_NEARMISS_INTERVAL /
                                                     12000.0 * m_sample_rate);
