@@ -115,10 +115,18 @@ static std::string strip_trailing_slash(const std::string &s)
 /* ------------------------------------------------------------------ */
 /* BroadcastHub                                                         */
 /* ------------------------------------------------------------------ */
+static constexpr size_t MSG_HISTORY_MAX = 500;
+
 struct BroadcastHub {
     ix::HttpServer *server = nullptr;
     std::mutex audio_mu;
     std::map<ix::WebSocket*, int64_t> audio_subs;
+
+    /* Ring buffer of the last MSG_HISTORY_MAX serialised message JSON strings
+     * (each is a complete {"type":"message","data":{...}} object).
+     * Protected by history_mu. */
+    std::mutex history_mu;
+    std::vector<std::string> history;   /* oldest-first */
 
     void sub_audio(ix::WebSocket *ws, int64_t f) {
         std::lock_guard<std::mutex> l(audio_mu); audio_subs[ws] = f;
@@ -149,8 +157,8 @@ struct BroadcastHub {
         for (auto &ws : server->getClients()) ws->sendText(j);
     }
 
-    void send_message(const DecodedMessage &dm) {
-        if (!server) return;
+    /* Build the enriched JSON string for a decoded message (without sending). */
+    std::string build_message_json(const DecodedMessage &dm) {
         std::string sc = MMSI::getCountry(dm.message.m_selfId);
         std::string scat = MMSI::getCategory(dm.message.m_selfId);
         std::string ac, cs;
@@ -185,7 +193,44 @@ struct BroadcastHub {
         j += ",\"rxFrequencyMHz\":\"" + freq_mhz(dm.frequency_hz) + "\"";
         j += ",\"rxBand\":\"" + json_escape(freq_band_name(dm.frequency_hz)) + "\"";
         j += "}}";
+        return j;
+    }
+
+    void send_message(const DecodedMessage &dm) {
+        std::string j = build_message_json(dm);
+        /* Store in history ring buffer */
+        {
+            std::lock_guard<std::mutex> l(history_mu);
+            if (history.size() >= MSG_HISTORY_MAX)
+                history.erase(history.begin());
+            history.push_back(j);
+        }
         send_json(j);
+    }
+
+    /* Send the full message history to a single newly-connected client. */
+    void send_history_to(ix::WebSocket *ws) {
+        std::vector<std::string> snap;
+        {
+            std::lock_guard<std::mutex> l(history_mu);
+            snap = history;   /* oldest-first copy */
+        }
+        if (snap.empty()) return;
+        /* Build {"type":"history","data":[...array of data objects...]} */
+        std::string j = "{\"type\":\"history\",\"data\":[";
+        for (size_t i = 0; i < snap.size(); i++) {
+            if (i) j += ",";
+            /* Each snap entry is {"type":"message","data":{...}}
+             * We want just the inner data object. */
+            const std::string &entry = snap[i];
+            auto pos = entry.find("\"data\":");
+            if (pos != std::string::npos)
+                j += entry.substr(pos + 7, entry.size() - pos - 7 - 1); /* strip trailing } */
+            else
+                j += "{}";
+        }
+        j += "]}";
+        ws->sendText(j);
     }
 
     void send_metrics(const std::vector<ChannelMetrics> &metrics) {
@@ -363,6 +408,11 @@ int main(int argc, const char **argv)
         [](std::shared_ptr<ix::ConnectionState> /*state*/,
            ix::WebSocket &client_ws,
            const ix::WebSocketMessagePtr &msg) {
+            /* On new connection, replay message history */
+            if (msg->type == ix::WebSocketMessageType::Open && g_hub) {
+                g_hub->send_history_to(&client_ws);
+                return;
+            }
             /* Handle audio-preview subscription control messages */
             if (msg->type == ix::WebSocketMessageType::Message &&
                 !msg->binary && g_hub) {

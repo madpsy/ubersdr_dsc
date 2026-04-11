@@ -272,6 +272,10 @@ static std::string make_html_page(const std::string &sdr_url,
     "if(!txt)return;"
     "try{var msg=JSON.parse(txt);"
     "if(msg.type==='message'&&msg.data)addMsg(msg.data);"
+    "if(msg.type==='history'&&Array.isArray(msg.data)){"
+    /* History arrives oldest-first; addMsg() prepends each row, so iterate
+     * in reverse so the oldest ends up at the bottom of the table. */
+    "for(var hi=msg.data.length-1;hi>=0;hi--)addMsg(msg.data[hi]);}"
     "if(msg.type==='metrics'&&msg.data)updateFreqs(msg.data);"
     "}catch(ex){}}};"
     "connect();"
