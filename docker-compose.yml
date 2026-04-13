@@ -12,6 +12,8 @@ services:
       # DSC_FREQS: "2187500,8414500"
       # Uncomment and set as needed:
       # WEB_PORT: "6093"
+      # UI_PASSWORD: ""   # Set a password to enable write actions in the web UI.
+                          # Leave empty (default) to disable all write actions.
     networks:
       - sdr-network
 
