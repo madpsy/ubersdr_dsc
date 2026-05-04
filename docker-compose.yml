@@ -16,6 +16,12 @@ services:
                           # Leave empty (default) to disable all write actions.
     networks:
       - sdr-network
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        tag: "dsc"
 
 networks:
   sdr-network:
