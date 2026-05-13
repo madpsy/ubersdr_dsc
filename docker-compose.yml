@@ -3,6 +3,7 @@ services:
     container_name: dsc
     image: madpsy/ubersdr_dsc:latest
     restart: unless-stopped
+    cpu_shares: 512
     environment:
       # UberSDR base URL
       UBERSDR_URL: "http://ubersdr:8080"
