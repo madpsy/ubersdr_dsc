@@ -5,7 +5,7 @@
  * Each channel independently:
  *   1. Generates a UUID v4 session ID
  *   2. POSTs /connection to register with ubersdr
- *   3. Opens a WebSocket for PCM-zstd audio
+ *   3. Opens a WebSocket for lossless audio (protocol version 4)
  *   4. Sends keepalive pings every 30 s
  *   5. Feeds decoded PCM to its own dsc_rx instance
  *   6. Reconnects on disconnect (10 s backoff)
@@ -21,13 +21,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-
-#include <arpa/inet.h>   /* ntohs */
+#include <string>
 
 #include <curl/curl.h>
-#include <zstd.h>
 
 #include <ixwebsocket/IXNetSystem.h>
+
+#include "pcm_v4.hpp"
 
 /* ================================================================== */
 /* Helper functions (adapted from navtex_rx_from_ubersdr.cpp)          */
@@ -129,124 +129,94 @@ static std::string strip_slash(const std::string &s)
 }
 
 /* ------------------------------------------------------------------ */
-/* Little-endian readers                                                */
-/* ------------------------------------------------------------------ */
-static inline uint32_t read_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static inline uint16_t read_le16(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-/* ------------------------------------------------------------------ */
-/* PCM-zstd frame decoder                                               */
+/* Audio protocol version 4 frame decoder                               */
 /* ------------------------------------------------------------------ */
 
 /*
- * Header magic values (little-endian uint16):
- *   Full header:    0x5043  ("CP" on wire)
- *   Minimal header: 0x504D  ("MP" on wire)
+ * Version 4 replaced the zstd wrapper of versions 1-3 with a predictive
+ * lossless codec and a variable-length header, so there is no compression
+ * library here at all: pcm_v4.hpp is header-only and self-contained.
+ *
+ * The header carries the sample rate and the channel count itself — on a
+ * resynchronisation packet, which is also the first packet any decoder will
+ * accept — so nothing below assumes 10000 Hz or two channels.  Whatever the
+ * server says is what reaches dsc_rx.
  */
-static const uint16_t MAGIC_FULL    = 0x5043;
-static const uint16_t MAGIC_MINIMAL = 0x504D;
-
-/* Full header v1 = 29 bytes, v2 = 37 bytes, minimal = 13 bytes */
-static const size_t FULL_HDR_V1 = 29;
-static const size_t FULL_HDR_V2 = 37;
-static const size_t MIN_HDR     = 13;
 
 struct PcmMeta {
     uint32_t sample_rate        = 0;
     uint8_t  channels           = 0;
-    float    baseband_power     = 0.0f;  /* dBFS, v2 header only */
-    float    noise_density      = 0.0f;  /* dBFS/Hz, v2 header only */
+    float    baseband_power     = 0.0f;  /* dBFS */
+    /* Version 4 reports the noise POWER in the demodulator passband in dBFS,
+     * not the dBFS/Hz density versions 1-3 sent -- the two differ by
+     * 10*log10(passband), about 34 dB.  Nothing in this program reads either
+     * field (the RSSI the UI shows is computed by dsc_rx from the samples), so
+     * the migration changes no displayed number here; the name says which one
+     * it is so that stays true if something ever does read it. */
+    float    noise_dbfs         = 0.0f;  /* dBFS, passband noise power */
     bool     has_signal_quality = false;
+
+    /* Consecutive decode failures, so a desynchronised stream reports itself
+     * once rather than once per packet on every channel.  Cleared by the next
+     * packet that decodes. */
+    unsigned long decode_errors = 0;
 };
 
 /*
- * Decompress one zstd-compressed PCM frame.
- * Fills meta (from full header), appends little-endian int16 samples to pcm_le.
- * Returns true on success.
+ * Decode one WebSocket binary frame.
+ *
+ * `dec` holds the stream's adaptation state and belongs to exactly one
+ * WebSocket: the predictor is backward adaptive, so every packet has to reach
+ * it (even one whose samples are then dropped) and it has to be reset when a
+ * new socket opens.
+ *
+ * Fills meta from the packet header and the samples into pcm_le, host-order
+ * int16.  Unlike versions 1-3 the codec emits host order already, so there is
+ * no byte swap.
  */
-static bool decode_pcm_zstd_frame(const void *compressed, size_t compressed_len,
-                                   std::vector<uint8_t> &decomp_buf,
-                                   PcmMeta &meta,
-                                   std::vector<int16_t> &pcm_le)
+static bool decode_pcm_v4_frame(ubersdr::PCMv4StreamDecoder &dec,
+                                const void *frame, size_t frame_len,
+                                PcmMeta &meta,
+                                std::vector<int16_t> &pcm_le)
 {
-    /* Decompress */
-    size_t frame_size = ZSTD_getFrameContentSize(compressed, compressed_len);
-    if (frame_size == ZSTD_CONTENTSIZE_ERROR ||
-        frame_size == ZSTD_CONTENTSIZE_UNKNOWN) {
-        /* Try a fixed upper bound */
-        frame_size = compressed_len * 8;
-    }
-    if (decomp_buf.size() < frame_size)
-        decomp_buf.resize(frame_size);
+    const uint8_t *p = static_cast<const uint8_t *>(frame);
 
-    size_t actual = ZSTD_decompress(decomp_buf.data(), decomp_buf.size(),
-                                    compressed, compressed_len);
-    if (ZSTD_isError(actual)) {
-        fprintf(stderr, "zstd error: %s\n", ZSTD_getErrorName(actual));
+    if (ubersdr::PCMv4StreamDecoder::isZstdFrame(p, frame_len)) {
+        /* A server older than 0.1.63 clamps the requested version to 1-3 and
+         * answers with a zstd frame rather than refusing.  Say so plainly
+         * instead of reporting "bad magic" on every packet. */
+        if (++meta.decode_errors == 1)
+            fprintf(stderr, "pcm v4: server sent a version 1-3 zstd frame; "
+                            "it is older than 0.1.63 and cannot serve version 4\n");
         return false;
     }
 
-    const uint8_t *p   = decomp_buf.data();
-    const uint8_t *end = p + actual;
-
-    if (actual < 2) return false;
-
-    /* Magic is little-endian uint16 */
-    uint16_t magic = read_le16(p);
-    size_t   hdr_size = 0;
-
-    if (magic == MAGIC_FULL) {
-        /* Full header: version byte at offset 2 determines size */
-        if (actual < 3) return false;
-        uint8_t version = p[2];
-        hdr_size = (version >= 2) ? FULL_HDR_V2 : FULL_HDR_V1;
-        if (actual < hdr_size) return false;
-
-        /* sample_rate at offset 20 (little-endian uint32) */
-        meta.sample_rate = read_le32(p + 20);
-        /* channels at offset 24 (uint8) */
-        meta.channels    = p[24];
-
-        /* v2: baseband_power at offset 25, noise_density at offset 29 (LE float32) */
-        if (version >= 2) {
-            uint32_t bb_bits, nd_bits;
-            bb_bits = (uint32_t)p[25] | ((uint32_t)p[26]<<8) | ((uint32_t)p[27]<<16) | ((uint32_t)p[28]<<24);
-            nd_bits = (uint32_t)p[29] | ((uint32_t)p[30]<<8) | ((uint32_t)p[31]<<16) | ((uint32_t)p[32]<<24);
-            memcpy(&meta.baseband_power, &bb_bits, 4);
-            memcpy(&meta.noise_density,  &nd_bits, 4);
-            meta.has_signal_quality = true;
-        } else {
-            meta.has_signal_quality = false;
-        }
-
-    } else if (magic == MAGIC_MINIMAL) {
-        hdr_size = MIN_HDR;
-        if (actual < hdr_size) return false;
-        /* Minimal header reuses last known sample_rate/channels */
-    } else {
-        fprintf(stderr, "unknown PCM magic: 0x%04x\n", magic);
+    ubersdr::PCMv4Header h;
+    std::string err;
+    if (!dec.decode(p, frame_len, h, err)) {
+        ++meta.decode_errors;
+        if (meta.decode_errors == 1 || meta.decode_errors % 500 == 0)
+            fprintf(stderr, "pcm v4: %s (%lu consecutive)\n",
+                    err.c_str(), meta.decode_errors);
         return false;
     }
+    meta.decode_errors = 0;
 
-    /* PCM payload: big-endian int16, convert to host (little-endian) */
-    const uint8_t *pcm_start = p + hdr_size;
-    size_t         pcm_bytes = (size_t)(end - pcm_start);
-    size_t         n_samples = pcm_bytes / 2;
+    meta.sample_rate = (uint32_t)h.sampleRate;
+    meta.channels    = (uint8_t)h.channels;
+    meta.baseband_power = h.basebandPower;
+    meta.noise_dbfs     = h.noise;
+    /* -999 is the "radiod reported nothing" sentinel.  Quality rides every
+     * resynchronisation packet, and a resync is the first packet the decoder
+     * accepts, so this is set from real data from the first frame on. */
+    meta.has_signal_quality = (h.basebandPower > -998.0f);
 
-    pcm_le.resize(n_samples);
-    for (size_t i = 0; i < n_samples; i++) {
-        int16_t be;
-        memcpy(&be, pcm_start + i * 2, 2);
-        pcm_le[i] = (int16_t)ntohs((uint16_t)be);
+    const int16_t *s = dec.samples();
+    if (s == nullptr || h.sampleCount <= 0) {
+        pcm_le.clear();
+        return true;
     }
+    pcm_le.assign(s, s + h.sampleCount);
     return true;
 }
 
@@ -494,14 +464,21 @@ void ChannelManager::channelLoop(Channel* ch)
 
     /* Per-channel decoder state — persists across reconnects */
     PcmMeta              meta;
-    std::vector<uint8_t> decomp_buf;
     std::vector<int16_t> pcm_le;
-    /* mode=iq always delivers 10000 Hz, 2-channel CS16.
-     * Initialise to the known values so minimal-header packets (which do not
-     * carry sample-rate or channel-count) are handled correctly from the very
-     * first frame. */
+    bool                 warned_channels = false;
+
+    /* The version 4 stream decoder holds this channel's adaptation state.  It
+     * belongs to one WebSocket, so it is reset at the top of every session
+     * below; unlike dsc_rx it must NOT carry state across reconnects. */
+    ubersdr::PCMv4StreamDecoder v4;
+
+    /* dsc_rx has to exist before the first frame arrives, so it is built at the
+     * rate mode=iq has always delivered.  That is only a starting value: the
+     * version 4 header carries the rate and the channel count on every
+     * resynchronisation packet, and a resync is the first packet the decoder
+     * will accept, so the loop below rebuilds dsc_rx from the wire the moment
+     * the server says anything else.  Nothing downstream assumes 10 kHz. */
     int                  current_sample_rate = 10000;
-    meta.channels = 2;
 
     /* Short label used in debug log lines, e.g. "16.8060 MHz" */
     char ch_label_buf[32];
@@ -567,7 +544,7 @@ void ChannelManager::channelLoop(Channel* ch)
         char ws_url[1024];
         snprintf(ws_url, sizeof(ws_url),
                  "%s/ws?frequency=%lld&mode=iq"
-                 "&format=pcm-zstd&version=2"
+                 "&format=pcm-zstd&version=4"
                  "&user_session_id=%s",
                  ws_base.c_str(), (long long)dial_hz, ch->session_id.c_str());
 
@@ -576,6 +553,12 @@ void ChannelManager::channelLoop(Channel* ch)
 
         /* 3. Open WebSocket */
         std::atomic<bool> session_done{false};
+
+        /* A new socket is a new stream: the version 4 predictor is backward
+         * adaptive, so carrying the previous session's taps into this one would
+         * decode the first packets as noise.  Reset before any frame can
+         * arrive, i.e. before the socket is created. */
+        v4.reset();
 
         ch->ws = std::make_unique<ix::WebSocket>();
         ch->ws->setUrl(ws_url);
@@ -623,12 +606,20 @@ void ChannelManager::channelLoop(Channel* ch)
 
                 case ix::WebSocketMessageType::Message:
                     if (msg->binary) {
-                        /* Binary frame: PCM-zstd compressed audio */
-                        if (!decode_pcm_zstd_frame(msg->str.data(), msg->str.size(),
-                                                   decomp_buf, meta, pcm_le))
+                        /* Binary frame: audio protocol version 4.
+                         * Every frame must reach the stream decoder, even one
+                         * whose samples are then dropped — it is the only thing
+                         * keeping this side's predictor in step with the
+                         * server's. */
+                        if (!decode_pcm_v4_frame(v4, msg->str.data(), msg->str.size(),
+                                                 meta, pcm_le))
                             break;
 
-                        /* Recreate decoder if sample rate changed */
+                        /* Rebuild dsc_rx if the rate the server reports differs
+                         * from the one it was built at.  On a version 4 stream
+                         * this is authoritative from the very first frame,
+                         * because that frame is a resynchronisation packet and
+                         * carries the rate. */
                         if (meta.sample_rate != 0 &&
                             (int)meta.sample_rate != current_sample_rate) {
                             fprintf(stderr, "channel %lld Hz: sample rate: %u Hz\n",
@@ -639,13 +630,27 @@ void ChannelManager::channelLoop(Channel* ch)
                         }
 
                         /* Feed IQ samples to the DSC decoder.
-                         * mode=iq always delivers 2-channel CS16 at 10000 Hz.
-                         * pcm_le contains interleaved pairs (I, Q, I, Q, ...).
-                         * process() takes the number of IQ *pairs*, not raw int16 count.
-                         * Note: meta.channels is pre-initialised to 2 above so this
-                         * guard works correctly even for minimal-header frames. */
+                         * mode=iq delivers interleaved I/Q, so the header says
+                         * two channels and pcm_le holds (I, Q, I, Q, ...).
+                         * process() takes the number of IQ *pairs*, not the raw
+                         * int16 count, so the divisor is the channel count the
+                         * header reported rather than a constant. */
                         if (!pcm_le.empty()) {
-                            int nb_pairs = (int)(pcm_le.size() / 2);
+                            if (meta.channels != 2) {
+                                if (!warned_channels) {
+                                    warned_channels = true;
+                                    fprintf(stderr,
+                                            "channel %lld Hz: server reports %u channels, "
+                                            "not the interleaved I/Q dsc_rx needs — "
+                                            "dropping samples\n",
+                                            (long long)ch->frequency_hz,
+                                            (unsigned)meta.channels);
+                                }
+                                break;
+                            }
+                            warned_channels = false;
+
+                            int nb_pairs = (int)(pcm_le.size() / meta.channels);
                             ch->decoder->process(pcm_le.data(), nb_pairs);
 
                             /* Forward raw IQ to audio callback (for web UI preview) */

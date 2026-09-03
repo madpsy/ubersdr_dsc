@@ -12,10 +12,11 @@ target_link_libraries(dsc_rx_from_file libdsc)
 
 # -----------------------------------------------------------------------
 # dsc_rx_from_ubersdr: receive audio from a ka9q_ubersdr server
-# Requires: libzstd, libcurl, IXWebSocket (+ OpenSSL for wss://)
+# Requires: libcurl, IXWebSocket (+ OpenSSL for wss://).
+# The audio protocol version 4 decoder (pcm_v4.hpp) is header-only and needs
+# no library, so there is no compression dependency here.
 # -----------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZSTD   REQUIRED libzstd)
 pkg_check_modules(CURL   REQUIRED libcurl)
 
 # IXWebSocket: prefer a system install, fall back to the copy bundled with
@@ -47,6 +48,25 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(ixwebsocket_bundled PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
+    # TLS, for wss:// -- which is what a tunnelled or public ubersdr server is
+    # reached on.
+    #
+    # IXWebSocket compiles its TLS support out unless these are defined: the
+    # OpenSSL backend is one big #ifdef IXWEBSOCKET_USE_OPEN_SSL, and
+    # IXSocketFactory consults IXWEBSOCKET_USE_TLS before it will create a
+    # secure socket at all. Upstream sets them in its own CMakeLists from
+    # option(USE_TLS), but this build GLOBs the sources rather than adding that
+    # project, so that option never runs -- and the result is not a build error.
+    # Linking OpenSSL, as the line above does, is not enough on its own: every
+    # wss:// connection just fails at runtime with "TLS support is not enabled
+    # on this platform".
+    #
+    # PUBLIC, and on the target rather than as a global add_definitions, so they
+    # travel to whatever links this the same way upstream's do.
+    target_compile_definitions(ixwebsocket_bundled PUBLIC
+        IXWEBSOCKET_USE_TLS
+        IXWEBSOCKET_USE_OPEN_SSL)
+
     set(IXWS_LIBS ixwebsocket_bundled)
     set(IXWS_INCLUDE_DIRS "${IXWS_ROOT}")
 endif()
@@ -54,15 +74,13 @@ endif()
 # pthreads (needed for multi-frequency channel management)
 find_package(Threads REQUIRED)
 
-# libdsc needs IXWebSocket, zstd, curl for channel_manager.cpp
+# libdsc needs IXWebSocket and curl for channel_manager.cpp
 target_include_directories(libdsc PUBLIC
     ${IXWS_INCLUDE_DIRS}
-    ${ZSTD_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
 )
 target_link_libraries(libdsc
     ${IXWS_LIBS}
-    ${ZSTD_LIBRARIES}
     ${CURL_LIBRARIES}
     Threads::Threads
     m
@@ -72,14 +90,12 @@ add_executable(dsc_rx_from_ubersdr dsc_rx_from_ubersdr.cpp)
 
 target_include_directories(dsc_rx_from_ubersdr PRIVATE
     ${IXWS_INCLUDE_DIRS}
-    ${ZSTD_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
 )
 
 target_link_libraries(dsc_rx_from_ubersdr
     libdsc
     ${IXWS_LIBS}
-    ${ZSTD_LIBRARIES}
     ${CURL_LIBRARIES}
     Threads::Threads
     m

@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         cmake \
         git \
-        libzstd-dev \
         libcurl4-openssl-dev \
         libssl-dev \
         pkg-config \
@@ -21,6 +20,9 @@ RUN git clone --depth 1 https://github.com/machinezone/IXWebSocket.git /ixwebsoc
 
 WORKDIR /src
 COPY src/ ./src/
+# test/ carries the protocol version 4 conformance fixtures; the top-level
+# CMakeLists.txt adds it as a subdirectory, so configure needs it present.
+COPY test/ ./test/
 COPY CMakeLists.txt .
 
 RUN cmake -B build \
@@ -36,7 +38,6 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libzstd1 \
         libcurl4 \
         libssl3 \
         ca-certificates \

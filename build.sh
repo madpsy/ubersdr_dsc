@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — build dsc_rx_from_ubersdr locally (no Docker)
 #
-# Requires: build-essential, cmake, libzstd-dev, libcurl4-openssl-dev,
+# Requires: build-essential, cmake, libcurl4-openssl-dev,
 #           libssl-dev, pkg-config, and IXWebSocket (cloned automatically)
 #
 # Usage:

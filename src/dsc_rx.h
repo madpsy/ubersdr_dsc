@@ -2,13 +2,18 @@
 /*
  * dsc_rx.h — DSC (Digital Selective Calling) FSK receiver
  *
- * Direct port of SDRangel DSCDemodSink (Jon Beniston, M7RCE) scaled for
- * 10000 Hz input from ubersdr (SDRangel uses 1000 Hz internally).
+ * Direct port of SDRangel DSCDemodSink (Jon Beniston, M7RCE), scaled from
+ * SDRangel's internal 1000 Hz to whatever rate ubersdr delivers.
  *
- * Signal chain (identical to SDRangel, all constants × RATE_SCALE=10):
- *   - Complex exponential table at FREQUENCY_SHIFT/2 = 85 Hz (len 6000)
+ * The scale is taken from the rate the receiver is CONSTRUCTED with, not
+ * assumed: the server's [iq] preset is 12 kHz, and a demodulator built for
+ * 10 kHz would have every tone spacing, filter cutoff and symbol period out by
+ * a factor of 1.2 while still producing plausible-looking output.
+ *
+ * Signal chain (identical to SDRangel, all constants × rateScale = rate/1000):
+ *   - Complex exponential table at FREQUENCY_SHIFT/2 = 85 Hz (len 600×scale)
  *   - Two FIR lowpass filters: 301 taps, cutoff = BAUD_RATE * 1.1 = 110 Hz
- *   - Two MovingMaximum envelope trackers: window = samplesPerBit * 8 = 800
+ *   - Two MovingMaximum envelope trackers: window = samplesPerBit * 8
  *   - ATC: bias = abs - 0.5 * env
  *   - Clock recovery: rising edge (0→1) only, 25% correction
  *   - Phasing: exact 30-bit pattern match
@@ -47,16 +52,42 @@ private:
 };
 
 // -----------------------------------------------------------------------
-// DSC receiver — IQ input, SDRangel-compatible demodulation at 10000 Hz
+// DSC receiver — IQ input, SDRangel-compatible demodulation at any rate that
+// is an integer multiple of 1000 Hz
 // -----------------------------------------------------------------------
 class dsc_rx {
 public:
     using MessageCallback = std::function<void(const DSCMessage& msg, int errors, float rssi)>;
 
-    // sample_rate: IQ sample rate from ubersdr (must be 10000 Hz)
+    // Everything the sample rate determines, in one place.
+    //
+    // Exposed so it can be asserted against: a demodulator tuned to the wrong
+    // rate does not fail, it just quietly stops decoding, so the only way to
+    // know these tracked the rate is to look at them.
+    struct RateConfig {
+        bool   supported;       // false: rate not an integer multiple of 1000 Hz
+        int    sample_rate;
+        int    rate_scale;      // sample_rate / 1000
+        int    exp_length;      // 600 * rate_scale
+        int    samples_per_bit; // sample_rate / 100
+        int    movmax_window;   // samples_per_bit * 8
+        double phase_step;      // radians/sample of the 85 Hz exponential
+        double lpf_sample_rate; // sample rate the 301-tap lowpass is designed at
+        double lpf_cutoff_hz;   // 110 Hz, independent of the sample rate
+    };
+
+    // Derive the configuration for a rate without building a receiver.
+    static RateConfig rateConfigFor(int sample_rate);
+
+    // sample_rate: IQ sample rate from ubersdr.  Must be an integer multiple of
+    // 1000 Hz; anything else is refused (see rateConfigFor) and the receiver
+    // then discards samples rather than decoding them mistuned.
     // label: short string for log lines, e.g. "16.806 MHz"
     dsc_rx(int sample_rate, MessageCallback callback,
            const std::string &label = "");
+
+    // What this instance was actually built with.
+    RateConfig getRateConfig() const { return m_rate; }
     ~dsc_rx() = default;
 
     // Feed CS16 interleaved I/Q samples (little-endian int16 pairs)
@@ -75,10 +106,11 @@ public:
 
 private:
     // ---- Configuration ----
-    int m_sample_rate;
+    int        m_sample_rate;
+    RateConfig m_rate;          // everything derived from m_sample_rate
 
     // ---- IQ demodulator state ----
-    std::vector<Complex> m_exp;      // complex exponential table (len 6000)
+    std::vector<Complex> m_exp;      // complex exponential table
     int                  m_expIdx;
 
     Lowpass<Complex> m_lpfMark;    // FIR lowpass, mark channel

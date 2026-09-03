@@ -97,7 +97,7 @@ docker build -t madpsy/ubersdr_dsc:latest .
 
 ### Local build (no Docker)
 
-Requires: `build-essential`, `cmake`, `libzstd-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `pkg-config`
+Requires: `build-essential`, `cmake`, `libcurl4-openssl-dev`, `libssl-dev`, `pkg-config`
 
 IXWebSocket is cloned automatically from GitHub if not present.
 
@@ -107,6 +107,57 @@ IXWebSocket is cloned automatically from GitHub if not present.
 ```
 
 Use `./build.sh --clean` to remove the build directory before rebuilding.
+
+### Tests
+
+Both suites at once, once the project is configured:
+
+```bash
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+**Demodulator sample rate.** `dsc_rx` derives its tone spacing, filter cutoffs,
+symbol period and envelope window from the sample rate the stream reports —
+12 kHz from the server's `[iq]` preset. The test asserts those constants track
+the rate (with the 10 kHz case reproducing the original values exactly),
+modulates a synthetic DSC transmission and checks every symbol is recovered at
+both rates, and checks that the same waveform fed to a receiver built for the
+wrong rate does *not* decode:
+
+```bash
+cmake --build build --target dsc_rate_test
+./build/test/dsc_rate_test
+```
+
+A rate that is not an integer multiple of 1000 Hz is refused rather than
+resampled or rounded: the channel logs a warning and decodes nothing, because a
+mistuned DSC decoder emits plausible-looking traffic rather than silence.
+
+**Audio protocol version 4 conformance** — decodes packet streams the
+**server's** encoder produced and compares the SHA-256 of the decoded samples:
+
+```bash
+cmake --build build --target pcmv4_conformance
+ctest --test-dir build --output-on-failure
+```
+
+Or without configuring the project at all (`src/pcm_v4.hpp` is header-only, so
+this needs nothing but a C++ compiler):
+
+```bash
+./test/run.sh
+```
+
+This matters more than it looks. The version 4 predictor is backward adaptive:
+the encoder and `src/pcm_v4.hpp` derive their filter taps independently from the
+samples already seen and never exchange a coefficient, so an arithmetic
+difference between the two returns plausible-sounding noise rather than an
+error. `test/testdata/pcmv4_stream.bin` covers mono audio, silent packets
+carrying no body, an escape to verbatim samples, a sample-rate change and the
+interleaved I/Q the DSC channels actually use; `pcmv4_rice_edge.bin` covers a
+Rice codeword whose unary run is exactly 63 bits, where a 64-bit shift is zero
+in Go and undefined in C++.
 
 ---
 
