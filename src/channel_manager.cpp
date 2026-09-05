@@ -225,8 +225,10 @@ static bool decode_pcm_v4_frame(ubersdr::PCMv4StreamDecoder &dec,
 /* ================================================================== */
 
 ChannelManager::ChannelManager(const std::string& ubersdr_base_url,
-                               MessageCallback on_message)
+                               MessageCallback on_message,
+                               int min_margin_db)
     : m_base_url(strip_slash(ubersdr_base_url))
+    , m_min_margin_db(min_margin_db)
     , m_on_message(std::move(on_message))
 {
     ix::initNetSystem();
@@ -541,12 +543,23 @@ void ChannelManager::channelLoop(Channel* ch)
          * complex exponentials relative to the tuned centre. */
         int64_t dial_hz = ch->frequency_hz;  // tune to DSC centre directly
 
+        /* min_margin asks for the reduced-depth I/Q described in
+         * channel_manager.h.  Sent only when it is non-zero, because an absent
+         * parameter and min_margin=0 mean the same lossless thing to a server
+         * that knows the parameter and an older one ignores it either way —
+         * omitting it is the form that behaves identically on both. */
+        char margin_arg[32];
+        margin_arg[0] = '\0';
+        if (m_min_margin_db > 0)
+            snprintf(margin_arg, sizeof(margin_arg), "&min_margin=%d", m_min_margin_db);
+
         char ws_url[1024];
         snprintf(ws_url, sizeof(ws_url),
                  "%s/ws?frequency=%lld&mode=iq"
                  "&format=pcm-zstd&version=4"
-                 "&user_session_id=%s",
-                 ws_base.c_str(), (long long)dial_hz, ch->session_id.c_str());
+                 "&user_session_id=%s%s",
+                 ws_base.c_str(), (long long)dial_hz, ch->session_id.c_str(),
+                 margin_arg);
 
         fprintf(stderr, "channel %lld Hz: connecting to %s\n",
                 (long long)ch->frequency_hz, ws_url);

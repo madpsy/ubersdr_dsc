@@ -13,6 +13,11 @@ services:
       # DSC_FREQS: "2187500,8414500"
       # Uncomment and set as needed:
       # WEB_PORT: "6093"
+      # DSC_MIN_MARGIN: "26"  # Reduced-depth I/Q: how far below the band's own
+                              # noise floor UberSDR holds the quantisation
+                              # floor, in dB.  26 is the transparent default;
+                              # 0 asks for lossless at roughly twice the
+                              # bandwidth, anything else must be 15-60.
       # UI_PASSWORD: ""   # Set a password to enable write actions in the web UI.
                           # Leave empty (default) to disable all write actions.
     networks:

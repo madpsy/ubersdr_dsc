@@ -19,6 +19,15 @@
 #                        and is counted out of a full 64-bit accumulator, so the
 #                        decoder shifts by 64.  Go defines that as zero and C++
 #                        does not, and the difference is silent.
+#   pcmv4_scaled.bin     the reduced-depth I/Q the min_margin request asks for:
+#                        profile 2, where a shift byte leads the body and the
+#                        samples come back shifted left by it.  It runs the
+#                        paths that exist only there — a shift that changes with
+#                        the margin, a silent packet that carries no shift at
+#                        all, an escape that carries one, and the profile
+#                        switching back to plain I/Q when the margin goes to
+#                        lossless.  Getting the shift wrong does not fail; it
+#                        hands the demodulator a signal several bits too quiet.
 #
 # Usage:
 #   ./run.sh                     # compiles the decoder standalone with g++
@@ -34,8 +43,9 @@ if [ -z "$BIN" ]; then
         || { echo "conformance build failed"; exit 1; }
 fi
 
-PCMV4_SHA256=ba368c898ae406c5acc806653d9f2dbbfa40086eca3707fda5d77c13948f78d1
-PCMV4_RICE_EDGE_SHA256=83e3d94b509efbf7a212a3e10193b3eb281fe1460cbfeef6aabe474c92a718c7
+PCMV4_SHA256=4875d2185f1ff5a2031386c569cac0c2259e6a827b9e61f813399a19c3b9c903
+PCMV4_RICE_EDGE_SHA256=3413109ff6d06d44fb8fa44c84595b776f5570f05663b762830853ddc0183527
+PCMV4_SCALED_SHA256=7315366ceed3e70552c28d31cde690a14dc66f5244b5a8dc34a5e696f5698ccc
 
 pass=0; fail=0
 
@@ -51,6 +61,7 @@ check() {
 
 check pcmv4-conformance testdata/pcmv4_stream.bin    "$PCMV4_SHA256"
 check pcmv4-rice-edge   testdata/pcmv4_rice_edge.bin "$PCMV4_RICE_EDGE_SHA256"
+check pcmv4-scaled      testdata/pcmv4_scaled.bin    "$PCMV4_SCALED_SHA256"
 
 # The demodulator's sample-rate handling, if it has been built. Needs libdsc,
 # so unlike the conformance cases above it is not standalone -- run

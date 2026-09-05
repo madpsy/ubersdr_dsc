@@ -49,6 +49,7 @@ All configuration is via environment variables in `docker-compose.yml`:
 | `UBERSDR_URL` | `http://ubersdr:8080` | UberSDR base URL |
 | `DSC_FREQS` | `2187500` | DSC frequencies in Hz, comma-separated (see [DSC frequencies](#dsc-frequencies) below) |
 | `WEB_PORT` | `6093` | Web UI port |
+| `DSC_MIN_MARGIN` | `26` | Reduced-depth I/Q request, in dB below the band's own noise floor (see [Reduced-depth I/Q](#reduced-depth-iq) below) |
 
 ### CLI arguments
 
@@ -56,6 +57,7 @@ When running the binary directly:
 
 ```
 dsc_rx_from_ubersdr [--sdr-url URL] [--web-port N] [--freqs f1,f2,...]
+                    [--min-margin dB]
 ```
 
 | Flag | Default | Description |
@@ -63,6 +65,24 @@ dsc_rx_from_ubersdr [--sdr-url URL] [--web-port N] [--freqs f1,f2,...]
 | `--sdr-url URL` | `http://localhost:8073` | UberSDR server base URL |
 | `--web-port N` | `6093` | Local web UI port |
 | `--freqs f1,f2,...` | all 25 ITU frequencies | Comma-separated frequencies in Hz |
+| `--min-margin dB` | `26` | Reduced-depth I/Q request; `0` for lossless, otherwise 15-60 |
+
+### Reduced-depth I/Q
+
+UberSDR sends lossless I/Q to any client that does not ask otherwise, at roughly
+twice the bytes. `min_margin` asks it instead to requantise each packet as far
+as it can while keeping the quantisation floor this many dB below the band's own
+noise floor — a request that means the same thing on a quiet 6 m band and on
+medium wave, where a fixed bit depth does not.
+
+26 dB is the measured transparent setting and is what every shipped UberSDR
+client defaults to, so it is what this one sends. `0` asks for lossless;
+anything else has to be 15-60, checked here at startup rather than left to the
+server, which clamps an out-of-range value silently.
+
+Needs UberSDR 0.1.64 or later. A server that has never heard of `min_margin`
+ignores it and sends the lossless stream, so an older server still works, it
+just costs more bandwidth.
 
 Examples:
 

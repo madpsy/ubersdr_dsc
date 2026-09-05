@@ -54,6 +54,25 @@ struct DecodedMessage {
 };
 
 /* ------------------------------------------------------------------ */
+/* Reduced-depth I/Q request (min_margin)                               */
+/*                                                                      */
+/* The server sends lossless I/Q to anything that does not ask          */
+/* otherwise, at roughly twice the bytes.  min_margin asks it instead   */
+/* to requantise each packet only as far as it can while keeping the    */
+/* quantisation floor this many dB below the band's own noise floor,    */
+/* which is a request the server can honour identically on a quiet 6 m  */
+/* band and on medium wave, where a fixed bit depth cannot.             */
+/*                                                                      */
+/* 26 dB is the measured transparent setting and is what every shipped  */
+/* ubersdr client defaults to.  0 asks for lossless.  Anything else has */
+/* to be 15-60: the server silently clamps out-of-range values, so the  */
+/* range is checked here instead, where it can be reported.             */
+/* ------------------------------------------------------------------ */
+static const int kMinMarginDefaultDB = 26;
+static const int kMinMarginMinDB     = 15;
+static const int kMinMarginMaxDB     = 60;
+
+/* ------------------------------------------------------------------ */
 /* ChannelManager                                                       */
 /* ------------------------------------------------------------------ */
 class ChannelManager {
@@ -61,7 +80,8 @@ public:
     using MessageCallback = std::function<void(const DecodedMessage&)>;
     using AudioCallback = std::function<void(int64_t freq, const std::vector<int16_t>& pcm)>;
 
-    ChannelManager(const std::string& ubersdr_base_url, MessageCallback on_message);
+    ChannelManager(const std::string& ubersdr_base_url, MessageCallback on_message,
+                   int min_margin_db = kMinMarginDefaultDB);
     ~ChannelManager();
 
     // ---- Channel management ----
@@ -97,6 +117,7 @@ private:
     };
 
     std::string     m_base_url;
+    int             m_min_margin_db;   // 0 = lossless, otherwise 15-60
     MessageCallback m_on_message;
     AudioCallback   m_on_audio;
 

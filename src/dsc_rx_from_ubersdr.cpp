@@ -7,6 +7,7 @@
  *
  * Usage:
  *   dsc_rx_from_ubersdr [--sdr-url URL] [--web-port N] [--freqs f1,f2,...]
+ *                       [--min-margin dB]
  *
  * Each frequency gets its own ubersdr WebSocket connection and DSC decoder
  * via the ChannelManager class.  Decoded messages are broadcast to browser
@@ -300,6 +301,7 @@ int main(int argc, const char **argv)
 {
     std::string sdr_url = "http://localhost:8073";
     int web_port = 6093;
+    int min_margin_db = kMinMarginDefaultDB;
     std::vector<int64_t> frequencies;
 
     /* Parse command-line arguments */
@@ -332,20 +334,42 @@ int main(int argc, const char **argv)
                 fprintf(stderr, "error: no valid frequencies in --freqs\n");
                 return EXIT_FAILURE;
             }
+        } else if (arg == "--min-margin") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --min-margin requires a value\n");
+                return EXIT_FAILURE;
+            }
+            char *end = nullptr;
+            min_margin_db = (int)strtol(argv[++i], &end, 10);
+            /* Checked here rather than left to the server, which clamps an
+             * out-of-range margin silently and would hand back a stream coded
+             * to a value nobody asked for. */
+            if (!end || *end != '\0' || min_margin_db < 0 ||
+                (min_margin_db != 0 && (min_margin_db < kMinMarginMinDB ||
+                                        min_margin_db > kMinMarginMaxDB))) {
+                fprintf(stderr, "invalid min margin: %s (0 for lossless, otherwise %d-%d dB)\n",
+                        argv[i], kMinMarginMinDB, kMinMarginMaxDB);
+                return EXIT_FAILURE;
+            }
         } else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [--sdr-url URL] [--web-port N] [--freqs f1,f2,...]\n"
+                "                           [--min-margin dB]\n"
                 "\n"
                 "  --sdr-url URL    ubersdr server base URL (default: http://localhost:8073)\n"
                 "  --web-port N     local web UI port (default: 6093)\n"
                 "  --freqs f1,f2    comma-separated frequencies in Hz\n"
                 "                   (default: all 26 ITU DSC frequencies)\n"
+                "  --min-margin dB  reduced-depth I/Q: hold the quantisation floor this\n"
+                "                   far below the band noise floor (default: %d, 0 for\n"
+                "                   lossless, otherwise %d-%d)\n"
                 "\n"
                 "Examples:\n"
                 "  %s --sdr-url http://192.168.1.10:8073\n"
                 "  %s --freqs 2187500,8414500,16804500\n"
                 "  %s --sdr-url http://sdr:8073 --web-port 8080 --freqs 2187500\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                argv[0], kMinMarginDefaultDB, kMinMarginMinDB, kMinMarginMaxDB,
+                argv[0], argv[0], argv[0]);
             return EXIT_SUCCESS;
         } else {
             fprintf(stderr, "unknown argument: %s\n", arg.c_str());
@@ -363,6 +387,10 @@ int main(int argc, const char **argv)
 
     fprintf(stderr, "ubersdr server : %s\n", sdr_url.c_str());
     fprintf(stderr, "web UI         : http://localhost:%d/\n", web_port);
+    if (min_margin_db > 0)
+        fprintf(stderr, "min margin     : %d dB\n", min_margin_db);
+    else
+        fprintf(stderr, "min margin     : lossless\n");
     fprintf(stderr, "frequencies    : %zu channels\n", frequencies.size());
     for (auto f : frequencies)
         fprintf(stderr, "  %s MHz (%s)\n", freq_mhz(f).c_str(), freq_band_name(f).c_str());
@@ -479,7 +507,7 @@ int main(int argc, const char **argv)
 
         /* Broadcast to browser clients */
         hub.send_message(dm);
-    });
+    }, min_margin_db);
 
     /* Wire audio callback so decoded PCM reaches the web UI audio preview */
     mgr.setAudioCallback([](int64_t freq, const std::vector<int16_t>& pcm) {
